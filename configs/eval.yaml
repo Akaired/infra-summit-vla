@@ -6,11 +6,25 @@
 # (steps MuJoCo) and the standalone benchmark (does NOT step MuJoCo).
 
 episode:
+  # Counted in PHYSICS steps (mj_step calls), the sim's native unit -- same
+  # unit as randomization.yaml `placement.settle_max_steps`. The harness runs
+  # one policy action every `physics.control_decimation` (configs/sim.yaml)
+  # steps, so the per-episode policy-call budget is
+  # ceil(max_steps / control_decimation). An episode ends earlier if every
+  # implemented subtask completes.
   max_steps: 2000
   # Natural-language command, taken from the brief's example.
   instruction: >-
     Open the top drawer, pick up the plate with arm A, place it on the table,
     pick up the mug with arm B, pour water into the mug with arm A.
+
+# Sibling configs the harness reads. Listed here so the entry points have a
+# single source for where scene / randomization / policy parameters come from
+# -- no config path is spelled out in the Python.
+configs:
+  sim: configs/sim.yaml
+  randomization: configs/randomization.yaml
+  policy: configs/policy.yaml
 
 # Logged per episode; order defines the expected task sequence. The brief
 # requires at least one hand-off or complementary dual-arm action.
@@ -26,6 +40,66 @@ success:
   require_all_subtasks: true
   # Partial credit accounting for the write-up, even when the run fails.
   report_partial_completion: true
+
+# The policy sees the full multi-camera observation defined by
+# configs/sim.yaml:cameras plus the robot state. Policies that take a narrower
+# input are adapted in eval/policy_interface.py; the dummy interface policy
+# takes a single RGB frame, and this names which camera it receives. It is also
+# the camera written to the per-seed demo video.
+policy:
+  primary_camera: overhead
+
+# ---------------------------------------------------------------------------
+# Subtask detection thresholds.
+#
+# The harness confirms each subtask from MJCF body/joint state, never from a
+# signal the policy emits -- a subtask counts only when the physics agrees.
+# Every value here is a geometric tolerance; none may live in the Python
+# (CONTRIBUTING.md 3, PRD 5). Body names come from configs/sim.yaml:objects;
+# only the drawer's slide-joint name and the tolerances are new here.
+# ---------------------------------------------------------------------------
+detection:
+  # Slide joint that opens the drawer (configs/sim.yaml:objects has the drawer
+  # BODY name but not its joint). Its travel RANGE is read from the compiled
+  # model, so only the name is config.
+  drawer_joint: drawer_slide
+
+  # Linear speed (m/s) below which a body is treated as "at rest" -- used by
+  # the *_placed checks so a still-moving object doesn't latch as placed.
+  resting_linear_speed_mps: 0.05
+
+  # drawer_opened: fraction of the slide joint's full travel that must be
+  # reached. 0.6 of the 0.16 m range clears the tabletop overhang enough that
+  # the cavity is reachable from above (see the drawer comment in the MJCF).
+  drawer_opened_travel_fraction: 0.6
+
+  # cutlery_retrieved: a cutlery body counts as retrieved once its height
+  # rises this far above where that same piece started this episode (an arm
+  # has raised it clear of the table / lifted it out of the open drawer).
+  # Measured as a delta from the per-piece post-settle spawn height so the
+  # mesh-origin offset cancels -- see eval/subtasks.py bind_spawn_reference.
+  cutlery_retrieved_lift_m: 0.06
+
+  # plate_placed / cup_placed: the object must have moved at least this far in
+  # XY from its post-settle spawn position AND have returned to within
+  # on_surface_tolerance_m of that spawn height AND be at rest. The XY term
+  # rejects "never actually manipulated"; the height + rest terms reject
+  # "still in the gripper" and "mid-air".
+  placed_min_xy_displacement_m: 0.05
+  on_surface_tolerance_m: 0.02
+
+  # handoff_completed: the target object must be seen in gripper-finger
+  # contact with one arm and then, later, with the other arm -- tracked
+  # statefully across steps. `handoff_object` is a configs/sim.yaml:objects
+  # key. NOTE: with placeholder arms this is a co-contact proxy for a true
+  # sequential transfer; tighten it once the real SO-101 grippers land.
+  handoff_object: plate
+
+  # pour_completed: NOT IMPLEMENTED. The scene has no simulated liquid, so no
+  # physical state can confirm a pour. The harness logs this subtask as
+  # "not_implemented" -- never as success. Flip to true and implement the
+  # detector in eval/subtasks.py once a liquid/particle model lands in /sim.
+  pour_enabled: false
 
 logging:
   output_dir: outputs/eval
