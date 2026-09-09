@@ -23,7 +23,12 @@ dependencies = []
 
 [project.optional-dependencies]
 # MuJoCo scene + domain randomization (feature/mujoco-scene)
-sim = []
+# numpy / PyYAML come transitively; they are version-pinned in the `dummy` extra
+# and must stay co-satisfiable with it, so they are not re-pinned here.
+sim = [
+    "mujoco==3.12.0",
+    "mediapy==1.2.7",
+]
 
 # LeRobot fine-tuning / distillation, ONNX export (feature/policy-training)
 # Training only -- not needed on the Intel demo machine.

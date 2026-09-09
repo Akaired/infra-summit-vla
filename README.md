@@ -16,9 +16,10 @@ and targeted at CPU / iGPU / NPU.
 - [Project PRD v2](./PRD_bimanual_vla_robot_simulation_v2.md) — the authoritative build spec
 - [CONTRIBUTING.md](./CONTRIBUTING.md) — git workflow (EN/RU)
 
-> **Status: scaffolding.** Directory structure, configuration surface, and the
-> contribution workflow are in place. No simulation, policy, inference, or eval
-> code has been written yet.
+> **Status: early build.** `/sim` has a placeholder dual-arm scene with full
+> domain randomization and a seed viewer; `/policy` has a SmolVLA-via-LeRobot
+> training/eval-smoke pipeline. `/inference` and `/eval` are still README-only.
+> The real SO-101 arm rig is not in the scene yet.
 
 ---
 
@@ -52,12 +53,25 @@ rubric line (*Technical Quality & Reproducibility*, 10 pts).
 ```bash
 git clone https://github.com/Akaired/infra-summit-vla.git
 cd infra-summit-vla
+
+uv venv --python 3.12
+source .venv/bin/activate
+
+# /sim: mujoco is not in pyproject's `sim` extra yet — install explicitly
+uv pip install mujoco mediapy numpy pyyaml pytest
+python sim/smoke_test.py            # scene compiles, name contract holds, cameras render
+python sim/test_randomization.py    # domain randomization across all 10 eval seeds
+python sim/viewer_seeds.py          # interactive; [ / ] cycle seeds live
+
+# /policy (training only, heavy): set configs/policy.yaml:experiment.device to cpu first
+uv pip install "lerobot[smolvla,dataset]==0.6.1"
+python policy/dummy_policy.py --config configs/policy.yaml \
+  --instruction "open drawer" --smoke-test
 ```
 
-Dependencies are not pinned yet: `pyproject.toml` carries empty
-`sim` / `policy` / `inference` / `eval` extras that get populated as each module
-lands. Run commands will be documented here as they exist — nothing is runnable
-today.
+Dependencies are only partially pinned: `pyproject.toml` still carries empty
+`sim` / `inference` / `eval` extras that get populated as each module stabilizes.
+The full command list lives in [`CLAUDE.md`](./CLAUDE.md#toolchain-and-commands).
 
 ## No hardcoded values
 
