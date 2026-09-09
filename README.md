@@ -18,7 +18,9 @@ and targeted at CPU / iGPU / NPU.
 
 > **Status: early build.** `/sim` has a placeholder dual-arm scene with full
 > domain randomization and a seed viewer; `/policy` has a SmolVLA-via-LeRobot
-> training/eval-smoke pipeline. `/inference` and `/eval` are still README-only.
+> training/eval-smoke pipeline; `/eval` has the 10-seed episode harness, driven
+> by a dummy policy until the real runtime lands. The standalone Intel benchmark
+> (`/eval` deliverable #3) and `/inference` are still README-only.
 > The real SO-101 arm rig is not in the scene yet.
 
 ---
@@ -67,6 +69,10 @@ python sim/viewer_seeds.py          # interactive; [ / ] cycle seeds live
 uv pip install "lerobot[smolvla,dataset]==0.6.1"
 python policy/dummy_policy.py --config configs/policy.yaml \
   --instruction "open drawer" --smoke-test
+
+# /eval: 10-seed episode harness (reuses the /sim deps above)
+python eval/run_episodes.py --config configs/eval.yaml   # writes outputs/eval/
+pytest eval/test_harness.py                              # loop runs without crashing
 ```
 
 Dependencies are only partially pinned: `pyproject.toml` still carries empty
