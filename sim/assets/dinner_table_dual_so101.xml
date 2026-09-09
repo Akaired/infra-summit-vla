@@ -1,0 +1,391 @@
+<mujoco model="dinner_table_dual_so101_placeholder">
+  <!--
+    PLACEHOLDER RIG - not the real SO-101 MJCF.
+
+    Purpose: unblock everyone else (policy/inference/eval) with a scene that
+    already satisfies the sim.yaml contract:
+      - joint/body names prefixed left_ / right_ (robot.left_arm_prefix etc.)
+      - object body names match sim.yaml `objects:` exactly
+      - camera names match sim.yaml `cameras:` exactly (overhead, wrist_left, wrist_right)
+
+    Swap plan: once a real SO-101 MJCF exists (or gym-aloha is adopted),
+    replace the two <body name="left_arm_base".../> / right_arm_base subtrees
+    below. Nothing outside this file should need to change, because /sim,
+    /policy, /inference, /eval only ever talk to names, not this geometry.
+
+    Arm model: 5 revolute joints + 1 prismatic gripper per arm, built from
+    primitive capsules/boxes. Rough SO-101-like proportions (small desktop
+    arm), not a kinematic match to the real hardware.
+  -->
+
+  <compiler angle="radian" autolimits="true" meshdir="ycb" texturedir="ycb"/>
+
+  <!-- Explicit near/far clip distances, NOT left to auto-scaling.
+       MuJoCo scales the default znear by `stat.extent`, which is the
+       bounding box of the WHOLE scene -- once the room (4m floor, 1.5m
+       walls) was added, stat.extent grew to ~16.5m, pushing the effective
+       near-clip plane out to znear(0.01) * extent(16.5) = 0.165m. The wrist
+       cameras sit ~3cm from the gripper viewing objects a few cm away --
+       well inside that clip distance, so nearby geometry was being culled
+       entirely. This pins znear/zfar to fixed, scene-scale-independent
+       values so adding more room geometry later can never silently break
+       close-up cameras again. -->
+  <visual>
+    <map znear="0.001" zfar="20"/>
+  </visual>
+
+  <option timestep="0.002" gravity="0 0 -9.81" integrator="implicitfast"/>
+
+  <default>
+    <default class="arm_link">
+      <geom type="capsule" size="0.02" rgba="0.7 0.7 0.75 1" density="1200"/>
+      <joint type="hinge" damping="0.5" armature="0.01" frictionloss="0.05"/>
+    </default>
+    <default class="gripper_finger">
+      <geom type="box" rgba="0.2 0.2 0.2 1" density="1200"/>
+      <joint type="slide" damping="1.0" range="0 0.04"/>
+    </default>
+    <default class="manip_object">
+      <!-- Deliberately minimal: MuJoCo's default solref ("0.02 1") and
+           solimp are well-tested and stable for this kind of contact. A
+           previous version of this file overrode solref to "0.005 1.0"
+           (4x stiffer than default) -- combined with objects that were
+           spawning with several mm of initial table penetration (see the
+           per-object z below), that stiffness turned a small, ordinary
+           penetration into a large corrective impulse, launching objects
+           off the table. The real fix was the spawn heights; the stiff
+           solver was making a small problem catastrophic, not causing it.
+           Don't re-add solref/margin overrides here without a specific,
+           tested reason -- see randomization.py settle-loop docstring for
+           the second half of this fix. -->
+      <joint type="free" damping="0.001"/>
+      <geom density="500" friction="0.9 0.01 0.001"/>
+    </default>
+  </default>
+
+  <asset>
+    <texture name="tex_table" type="2d" builtin="checker" rgb1="0.55 0.35 0.2" rgb2="0.5 0.3 0.18" width="300" height="300"/>
+    <material name="mat_table" texture="tex_table" texrepeat="4 4" reflectance="0.05"/>
+    <material name="mat_drawer" rgba="0.45 0.3 0.2 1"/>
+    <material name="mat_bottle" rgba="0.2 0.5 0.3 0.8"/>
+    <material name="mat_metal" rgba="0.75 0.75 0.78 1"/>
+    <texture name="tex_sky" type="skybox" builtin="gradient" rgb1="0.65 0.75 0.9" rgb2="0.15 0.2 0.3" width="256" height="256"/>
+
+    <!-- Room: light checkerboard floor, flat light-colored walls -->
+    <texture name="tex_floor" type="2d" builtin="checker" rgb1="0.82 0.82 0.84" rgb2="0.62 0.62 0.66" width="300" height="300"/>
+    <material name="mat_floor" texture="tex_floor" texrepeat="12 12" reflectance="0.1"/>
+    <material name="mat_wall" rgba="0.93 0.91 0.86 1"/>
+
+    <!-- ============ YCB MESH ASSETS ============
+         Source: github.com/elpis-lab/YCB_Dataset (CoACD collision decomp,
+         max 5 hulls / 32-face decimation). Tested directly (see randomization
+         notes): this decomposition DOES preserve a genuine hollow cavity --
+         a dropped pebble settles inside both the bowl and cup, not on the
+         floor beneath them. Do not re-decompose; the earlier "poured
+         concrete" appearance was from rendering the collision layer
+         directly (group 3, meant to stay hidden), not a real geometry
+         defect. -->
+    <mesh name="bowl_visual_mesh" file="bowl/textured.obj"/>
+    <mesh name="bowl_collision_mesh_0" file="bowl/textured_coacd_0.stl"/>
+    <mesh name="bowl_collision_mesh_1" file="bowl/textured_coacd_1.stl"/>
+    <mesh name="bowl_collision_mesh_2" file="bowl/textured_coacd_2.stl"/>
+    <mesh name="bowl_collision_mesh_3" file="bowl/textured_coacd_3.stl"/>
+    <mesh name="bowl_collision_mesh_4" file="bowl/textured_coacd_4.stl"/>
+    <texture name="bowl_texture" type="2d" file="bowl/texture_map.png"/>
+    <material name="bowl_material" texture="bowl_texture"/>
+
+    <mesh name="plate_visual_mesh" file="plate/textured.obj"/>
+    <mesh name="plate_collision_mesh_0" file="plate/textured_coacd_0.stl"/>
+    <mesh name="plate_collision_mesh_1" file="plate/textured_coacd_1.stl"/>
+    <mesh name="plate_collision_mesh_2" file="plate/textured_coacd_2.stl"/>
+    <mesh name="plate_collision_mesh_3" file="plate/textured_coacd_3.stl"/>
+    <mesh name="plate_collision_mesh_4" file="plate/textured_coacd_4.stl"/>
+    <texture name="plate_texture" type="2d" file="plate/texture_map.png"/>
+    <material name="plate_material" texture="plate_texture"/>
+
+    <mesh name="cup_visual_mesh" file="g_cups/textured.obj"/>
+    <mesh name="cup_collision_mesh_0" file="g_cups/textured_coacd_0.stl"/>
+    <mesh name="cup_collision_mesh_1" file="g_cups/textured_coacd_1.stl"/>
+    <mesh name="cup_collision_mesh_2" file="g_cups/textured_coacd_2.stl"/>
+    <mesh name="cup_collision_mesh_3" file="g_cups/textured_coacd_3.stl"/>
+    <mesh name="cup_collision_mesh_4" file="g_cups/textured_coacd_4.stl"/>
+    <texture name="cup_texture" type="2d" file="g_cups/texture_map.png"/>
+    <material name="cup_material" texture="cup_texture"/>
+
+    <mesh name="spoon_visual_mesh" file="spoon/textured.obj" />
+    <mesh name="spoon_collision_mesh_0" file="spoon/textured_coacd_0.stl" />
+    <mesh name="spoon_collision_mesh_1" file="spoon/textured_coacd_1.stl" />
+    <mesh name="spoon_collision_mesh_2" file="spoon/textured_coacd_2.stl" />
+    <mesh name="spoon_collision_mesh_3" file="spoon/textured_coacd_3.stl" />
+    <texture name="spoon_texture" type="2d" file="spoon/texture_map.png" />
+    <material name="spoon_material" texture="spoon_texture" />
+
+    <mesh name="fork_visual_mesh" file="fork/textured.obj" />
+    <mesh name="fork_collision_mesh_0" file="fork/textured_coacd_0.stl" />
+    <mesh name="fork_collision_mesh_1" file="fork/textured_coacd_1.stl" />
+    <texture name="fork_texture" type="2d" file="fork/texture_map.png" />
+    <material name="fork_material" texture="fork_texture" />
+  </asset>
+
+  <worldbody>
+    <light name="key_light" pos="0 0 1.6" dir="0 0 -1" diffuse="0.7 0.7 0.7" ambient="0.4 0.4 0.4"/>
+
+    <!-- ============ ROOM: floor + walls (background, not part of the task) ============
+         Static (no joint -> welded to world), so this adds zero simulation cost:
+         static-vs-static contacts generate no forces. Room is oversized (4m) relative
+         to the ~1m table+arm footprint so it never clips the workspace or cameras. -->
+    <geom name="floor" type="plane" size="4 4 0.1" pos="0 0 0" material="mat_floor"/>
+    <geom name="wall_back" type="box" size="4 0.05 1.5" pos="0 4 1.5" material="mat_wall"/>
+    <geom name="wall_left" type="box" size="0.05 4 1.5" pos="-4 0 1.5" material="mat_wall"/>
+    <geom name="wall_right" type="box" size="0.05 4 1.5" pos="4 0 1.5" material="mat_wall"/>
+    <!-- front wall intentionally omitted so it never occludes the overhead camera or a demo-recording viewpoint -->
+
+    <!-- ============ TABLE ============
+         group left at the default (0, visible) deliberately. Group is a
+         RENDER-ONLY tag -- it has zero physics effect -- and MuJoCo's
+         default viewer/renderer shows groups 0-2 but HIDES groups 3-5. A
+         previous version set group="3" on this geom to "hide the collision
+         mesh" logic that belonged on the YCB collision geoms below, which
+         made the table itself disappear. group=3 is for collision-only
+         meshes you want hidden (see bowl/plate/cup below); anything meant
+         to be seen -- like the table surface -- stays in the default group. -->
+    <body name="table" pos="0 0 0">
+      <geom name="table_top" type="box" size="0.5 0.35 0.02" pos="0 0 0.75" material="mat_table"/>
+      <geom type="box" size="0.03 0.03 0.375" pos="0.45 0.3 0.375" rgba="0.3 0.2 0.1 1"/>
+      <geom type="box" size="0.03 0.03 0.375" pos="-0.45 0.3 0.375" rgba="0.3 0.2 0.1 1"/>
+      <geom type="box" size="0.03 0.03 0.375" pos="0.45 -0.3 0.375" rgba="0.3 0.2 0.1 1"/>
+      <geom type="box" size="0.03 0.03 0.375" pos="-0.45 -0.3 0.375" rgba="0.3 0.2 0.1 1"/>
+    </body>
+
+    <!-- ============ DRAWER (single sliding joint body named `drawer`) ============
+         Rebuilt from a solid box into a genuine open-top hollow shell (5
+         thin panels: floor + 4 walls) so items can actually be stored
+         inside and stay contained, not just decorate a solid block.
+
+         Position also corrected: the previous version's closed position
+         overshot the table edge by 6cm even when fully closed (drawer
+         center y=0.32, half-extent 0.09 -> span [0.23,0.41] vs table edge
+         at y=0.35). Now: CLOSED position has the drawer's outer (+Y) face
+         exactly flush with the table edge (y=0.35) -- matches how a real
+         table drawer sits (front panel flush with the table's edge when
+         shut). The handle/front panel is on the +Y (outer, table-edge-
+         facing) wall, not the -Y (inner) wall as before -- that was
+         backwards: a robot reaching to open the drawer approaches from
+         above/in-front of the table edge, not by reaching deep under the
+         tabletop overhang to find the handle on the far inner side.
+
+         Slide direction unchanged (axis 0 1 0, range 0-0.16): positive =
+         sliding further OUT past the table edge, which is the standard way
+         a real drawer opens. When closed, the whole cavity sits under the
+         tabletop (y up to 0.35) so it's correctly hidden/inaccessible from
+         above. Once open (drawer center moves to ~0.35+), the cavity
+         clears the tabletop's footprint entirely and becomes genuinely
+         reachable from directly above -- not just visually "open" while
+         still blocked by the tabletop overhang.
+
+         No actuator drives this joint -- see conversation notes on how
+         opening actually works (gripper contact force on the handle panel,
+         same as any other object the arm pushes or pulls). -->
+    <body name="drawer" pos="0 0.27 0.68">
+      <joint name="drawer_slide" type="slide" axis="0 1 0" range="0 0.16" damping="4.0" frictionloss="1.0"/>
+
+      <!-- Floor -->
+      <geom name="drawer_floor" type="box" size="0.114 0.074 0.003" pos="0 0 -0.037" material="mat_drawer"/>
+      <!-- Side walls (+/- X) -->
+      <geom name="drawer_wall_left" type="box" size="0.003 0.08 0.037" pos="-0.117 0 0.003" material="mat_drawer"/>
+      <geom name="drawer_wall_right" type="box" size="0.003 0.08 0.037" pos="0.117 0 0.003" material="mat_drawer"/>
+      <!-- Back wall (-Y, toward table center, closed side) -->
+      <geom name="drawer_wall_back" type="box" size="0.114 0.003 0.037" pos="0 -0.077 0.003" material="mat_drawer"/>
+      <!-- Front/handle wall (+Y, toward table edge -- what the gripper grasps to pull it open) -->
+      <geom name="drawer_wall_front" type="box" size="0.114 0.003 0.037" pos="0 0.077 0.003" material="mat_drawer"/>
+      <!-- Handle: a small raised bar on the front wall's outer face, easier
+           for a gripper to actually close fingers around than a flat panel -->
+      <geom name="drawer_handle" type="cylinder" size="0.005 0.05" euler="1.5708 0 0"
+            pos="0 0.085 0.003" rgba="0.15 0.15 0.15 1"/>
+    </body>
+
+    <!-- ============ MANIPULABLE OBJECTS (names must match sim.yaml objects:) ============
+         Spawn z for bowl/plate/cup is NOT a shared guess (that was the bug).
+         Each is: table_top_surface (0.77) + that object's own MEASURED
+         origin-to-contact-point offset (settled empirically -- see
+         randomization notes) + 0.003 clearance. Guessing one z for all three
+         objects regardless of their actual mesh shape is exactly what
+         produced several mm of initial table penetration for bowl and cup. -->
+    <body name="bowl" pos="-0.2 -0.08 0.801">
+      <joint type="free" class="manip_object"/>
+      <geom name="bowl_visual_geom" type="mesh" mesh="bowl_visual_mesh" material="bowl_material" contype="0" conaffinity="0" group="0"/>
+      <geom name="bowl_collision_geom_0" type="mesh" mesh="bowl_collision_mesh_0" contype="1" conaffinity="1" group="3"/>
+      <geom name="bowl_collision_geom_1" type="mesh" mesh="bowl_collision_mesh_1" contype="1" conaffinity="1" group="3"/>
+      <geom name="bowl_collision_geom_2" type="mesh" mesh="bowl_collision_mesh_2" contype="1" conaffinity="1" group="3"/>
+      <geom name="bowl_collision_geom_3" type="mesh" mesh="bowl_collision_mesh_3" contype="1" conaffinity="1" group="3"/>
+      <geom name="bowl_collision_geom_4" type="mesh" mesh="bowl_collision_mesh_4" contype="1" conaffinity="1" group="3"/>
+      <inertial pos="0 0 0" mass="0.147" diaginertia="0.000527 0.000527 0.000977"/>
+    </body>
+
+    <body name="plate" pos="0.0 -0.1 0.786">
+      <joint type="free" class="manip_object"/>
+      <geom name="plate_visual_geom" type="mesh" mesh="plate_visual_mesh" material="plate_material" contype="0" conaffinity="0" group="0"/>
+      <geom name="plate_collision_geom_0" type="mesh" mesh="plate_collision_mesh_0" contype="1" conaffinity="1" group="3"/>
+      <geom name="plate_collision_geom_1" type="mesh" mesh="plate_collision_mesh_1" contype="1" conaffinity="1" group="3"/>
+      <geom name="plate_collision_geom_2" type="mesh" mesh="plate_collision_mesh_2" contype="1" conaffinity="1" group="3"/>
+      <geom name="plate_collision_geom_3" type="mesh" mesh="plate_collision_mesh_3" contype="1" conaffinity="1" group="3"/>
+      <geom name="plate_collision_geom_4" type="mesh" mesh="plate_collision_mesh_4" contype="1" conaffinity="1" group="3"/>
+      <inertial pos="0 0 0" mass="0.279" diaginertia="0.002279 0.002279 0.004528"/>
+    </body>
+
+    <body name="cup" pos="0.2 -0.08 0.809">
+      <joint type="free" class="manip_object"/>
+      <geom name="cup_visual_geom" type="mesh" mesh="cup_visual_mesh" material="cup_material" contype="0" conaffinity="0" group="0"/>
+      <geom name="cup_collision_geom_0" type="mesh" mesh="cup_collision_mesh_0" contype="1" conaffinity="1" group="3"/>
+      <geom name="cup_collision_geom_1" type="mesh" mesh="cup_collision_mesh_1" contype="1" conaffinity="1" group="3"/>
+      <geom name="cup_collision_geom_2" type="mesh" mesh="cup_collision_mesh_2" contype="1" conaffinity="1" group="3"/>
+      <geom name="cup_collision_geom_3" type="mesh" mesh="cup_collision_mesh_3" contype="1" conaffinity="1" group="3"/>
+      <geom name="cup_collision_geom_4" type="mesh" mesh="cup_collision_mesh_4" contype="1" conaffinity="1" group="3"/>
+      <inertial pos="0 0 0" mass="0.028" diaginertia="0.000054 0.000054 0.000084"/>
+    </body>
+
+
+    <body name="bottle" pos="0.25 0.05 0.86">
+      <joint class="manip_object"/>
+      <geom type="cylinder" size="0.025 0.09" material="mat_bottle"/>
+    </body>
+
+    <!--
+      Cutlery must lie FLAT on the table. A capsule's long axis defaults to
+      local Z, so a small euler tilt (a few degrees) still leaves it nearly
+      vertical -- it takes a full 90 deg rotation to lie down, not a nudge.
+      Rotating -90 deg (-1.5708 rad) about X maps local Z -> global Y, so the
+      capsule's 0.06 half-length now runs along Y (flat) instead of standing
+      up through the table. z = table_top_surface (0.75 + 0.02 = 0.77) +
+      capsule radius (0.006) = 0.776, so it rests exactly on the surface
+      instead of floating above it or clipping into it.
+    -->
+    <body name="spoon_1" pos="-0.05 0.05 0.776" euler="-1.5708 0 0.05">
+      <joint type = 'free' class="manip_object"/>
+      <geom name="spoon_1_visual" type="mesh" mesh="spoon_visual_mesh" material="spoon_material" contype="0" conaffinity="0" group="0"/>
+      <geom name="spoon_1_coll_0" type="mesh" mesh="spoon_collision_mesh_0" contype="1" conaffinity="1" group="3"/>
+      <geom name="spoon_1_coll_1" type="mesh" mesh="spoon_collision_mesh_1" contype="1" conaffinity="1" group="3"/>
+      <geom name="spoon_1_coll_2" type="mesh" mesh="spoon_collision_mesh_2" contype="1" conaffinity="1" group="3"/>
+      <geom name="spoon_1_coll_3" type="mesh" mesh="spoon_collision_mesh_3" contype="1" conaffinity="1" group="3"/>
+      <inertial pos="0 0 0" mass="0.03" diaginertia="0.001 0.001 0.001"/>
+    </body>
+    <body name="spoon_2" pos="-0.02 0.05 0.776" euler="-1.5708 0 -0.05">
+      <joint type = 'free' class="manip_object"/>
+      <geom name="spoon_2_visual" type="mesh" mesh="spoon_visual_mesh" material="spoon_material" contype="0" conaffinity="0" group="0"/>
+      <geom name="spoon_2_coll_0" type="mesh" mesh="spoon_collision_mesh_0" contype="1" conaffinity="1" group="3"/>
+      <geom name="spoon_2_coll_1" type="mesh" mesh="spoon_collision_mesh_1" contype="1" conaffinity="1" group="3"/>
+      <geom name="spoon_2_coll_2" type="mesh" mesh="spoon_collision_mesh_2" contype="1" conaffinity="1" group="3"/>
+      <geom name="spoon_2_coll_3" type="mesh" mesh="spoon_collision_mesh_3" contype="1" conaffinity="1" group="3"/>
+      <inertial pos="0 0 0" mass="0.03" diaginertia="0.001 0.001 0.001"/>
+    </body>
+    <body name="fork_1" pos="0.02 0.05 0.776" euler="-1.5708 0 0.05">
+      <joint type = 'free' class="manip_object"/>
+      <geom name="fork_1_visual_geom" type="mesh" mesh="fork_visual_mesh" material="fork_material" pos="-0.0 0.0 -0.0" euler="0 0 0" contype="0" conaffinity="0" group="0" />
+      <geom name="fork_1_collision_geom_0" type="mesh" mesh="fork_collision_mesh_0" pos="-0.0 0.0 -0.0" euler="0 0 0" contype="1" conaffinity="1" group="3" />
+      <geom name="fork_1_collision_geom_1" type="mesh" mesh="fork_collision_mesh_1" pos="-0.0 0.0 -0.0" euler="0 0 0" contype="1" conaffinity="1" group="3" />
+      <inertial pos="0 0 0" euler="0 0 0" mass="0.034" diaginertia="0.001 0.001 0.001" />
+    </body>
+    <body name="fork_2" pos="0.05 0.05 0.776" euler="-1.5708 0 -0.05">
+      <joint type = 'free' class="manip_object"/>
+      <geom name="fork_2_visual_geom" type="mesh" mesh="fork_visual_mesh" material="fork_material" pos="-0.0 0.0 -0.0" euler="0 0 0" contype="0" conaffinity="0" group="0" />
+      <geom name="fork_2_collision_geom_0" type="mesh" mesh="fork_collision_mesh_0" pos="-0.0 0.0 -0.0" euler="0 0 0" contype="1" conaffinity="1" group="3" />
+      <geom name="fork_2_collision_geom_1" type="mesh" mesh="fork_collision_mesh_1" pos="-0.0 0.0 -0.0" euler="0 0 0" contype="1" conaffinity="1" group="3" />
+      <inertial pos="0 0 0" euler="0 0 0" mass="0.034" diaginertia="0.001 0.001 0.001" />
+    </body>
+
+    <!-- ============ LEFT ARM (prefix must match sim.yaml robot.left_arm_prefix) ============ -->
+    <body name="left_arm_base" pos="-0.55 0 0.75">
+      <geom class="arm_link" type="cylinder" size="0.04 0.03" rgba="0.3 0.3 0.35 1"/>
+      <body name="left_link1" pos="0 0 0.03">
+        <joint name="left_joint1" class="arm_link" axis="0 0 1" range="-3.05 3.05"/>
+        <geom class="arm_link" fromto="0 0 0 0 0 0.12"/>
+        <body name="left_link2" pos="0 0 0.12">
+          <joint name="left_joint2" class="arm_link" axis="0 1 0" range="-1.7 1.7"/>
+          <geom class="arm_link" fromto="0 0 0 0.18 0 0.05"/>
+          <body name="left_link3" pos="0.18 0 0.05">
+            <joint name="left_joint3" class="arm_link" axis="0 1 0" range="-2.8 0.1"/>
+            <geom class="arm_link" fromto="0 0 0 0.16 0 -0.02"/>
+            <body name="left_link4" pos="0.16 0 -0.02">
+              <joint name="left_joint4" class="arm_link" axis="0 1 0" range="-1.6 1.6"/>
+              <geom class="arm_link" size="0.015" fromto="0 0 0 0.08 0 0"/>
+              <body name="left_link5" pos="0.08 0 0">
+                <joint name="left_joint5" class="arm_link" axis="1 0 0" range="-3.05 3.05"/>
+                <geom class="arm_link" size="0.014" fromto="0 0 0 0.05 0 0"/>
+                <body name="left_gripper_base" pos="0.05 0 0">
+                  <camera name="wrist_left" mode="fixed" pos="0.03 0 0.03" xyaxes="0 -1 0  0.6428 0 0.7660" fovy="55"/>
+                  <geom type="box" size="0.015 0.03 0.015" rgba="0.2 0.2 0.2 1"/>
+                  <body name="left_finger1" pos="0.02 0.02 0">
+                    <joint name="left_gripper_joint1" class="gripper_finger" axis="0 1 0"/>
+                    <geom class="gripper_finger" size="0.006 0.015 0.006"/>
+                  </body>
+                  <body name="left_finger2" pos="0.02 -0.02 0">
+                    <joint name="left_gripper_joint2" class="gripper_finger" axis="0 -1 0"/>
+                    <geom class="gripper_finger" size="0.006 0.015 0.006"/>
+                  </body>
+                </body>
+              </body>
+            </body>
+          </body>
+        </body>
+      </body>
+    </body>
+
+    <!-- ============ RIGHT ARM (mirrored, prefix right_) ============ -->
+    <body name="right_arm_base" pos="0.55 0 0.75">
+      <geom class="arm_link" type="cylinder" size="0.04 0.03" rgba="0.3 0.3 0.35 1"/>
+      <body name="right_link1" pos="0 0 0.03">
+        <joint name="right_joint1" class="arm_link" axis="0 0 1" range="-3.05 3.05"/>
+        <geom class="arm_link" fromto="0 0 0 0 0 0.12"/>
+        <body name="right_link2" pos="0 0 0.12">
+          <joint name="right_joint2" class="arm_link" axis="0 1 0" range="-1.7 1.7"/>
+          <geom class="arm_link" fromto="0 0 0 -0.18 0 0.05"/>
+          <body name="right_link3" pos="-0.18 0 0.05">
+            <joint name="right_joint3" class="arm_link" axis="0 1 0" range="-0.1 2.8"/>
+            <geom class="arm_link" fromto="0 0 0 -0.16 0 -0.02"/>
+            <body name="right_link4" pos="-0.16 0 -0.02">
+              <joint name="right_joint4" class="arm_link" axis="0 1 0" range="-1.6 1.6"/>
+              <geom class="arm_link" size="0.015" fromto="0 0 0 -0.08 0 0"/>
+              <body name="right_link5" pos="-0.08 0 0">
+                <joint name="right_joint5" class="arm_link" axis="1 0 0" range="-3.05 3.05"/>
+                <geom class="arm_link" size="0.014" fromto="0 0 0 -0.05 0 0"/>
+                <body name="right_gripper_base" pos="-0.05 0 0">
+                  <camera name="wrist_right" mode="fixed" pos="-0.03 0 0.03" xyaxes="0 1 0  -0.6428 0 0.7660" fovy="55"/>
+                  <geom type="box" size="0.015 0.03 0.015" rgba="0.2 0.2 0.2 1"/>
+                  <body name="right_finger1" pos="-0.02 0.02 0">
+                    <joint name="right_gripper_joint1" class="gripper_finger" axis="0 1 0"/>
+                    <geom class="gripper_finger" size="0.006 0.015 0.006"/>
+                  </body>
+                  <body name="right_finger2" pos="-0.02 -0.02 0">
+                    <joint name="right_gripper_joint2" class="gripper_finger" axis="0 -1 0"/>
+                    <geom class="gripper_finger" size="0.006 0.015 0.006"/>
+                  </body>
+                </body>
+              </body>
+            </body>
+          </body>
+        </body>
+      </body>
+    </body>
+
+    <!-- ============ OVERHEAD CAMERA (name must match sim.yaml cameras:) ============ -->
+    <camera name="overhead" mode="fixed" pos="0 0 1.55" euler="0 0 0" fovy="60"/>
+
+  </worldbody>
+
+  <actuator>
+    <position name="left_joint1_act" joint="left_joint1" kp="15" ctrlrange="-3.05 3.05"/>
+    <position name="left_joint2_act" joint="left_joint2" kp="15" ctrlrange="-1.7 1.7"/>
+    <position name="left_joint3_act" joint="left_joint3" kp="15" ctrlrange="-2.8 0.1"/>
+    <position name="left_joint4_act" joint="left_joint4" kp="10" ctrlrange="-1.6 1.6"/>
+    <position name="left_joint5_act" joint="left_joint5" kp="8" ctrlrange="-3.05 3.05"/>
+    <position name="left_gripper_act" joint="left_gripper_joint1" kp="20" ctrlrange="0 0.04"/>
+
+    <position name="right_joint1_act" joint="right_joint1" kp="15" ctrlrange="-3.05 3.05"/>
+    <position name="right_joint2_act" joint="right_joint2" kp="15" ctrlrange="-1.7 1.7"/>
+    <position name="right_joint3_act" joint="right_joint3" kp="15" ctrlrange="-0.1 2.8"/>
+    <position name="right_joint4_act" joint="right_joint4" kp="10" ctrlrange="-1.6 1.6"/>
+    <position name="right_joint5_act" joint="right_joint5" kp="8" ctrlrange="-3.05 3.05"/>
+    <position name="right_gripper_act" joint="right_gripper_joint1" kp="20" ctrlrange="0 0.04"/>
+  </actuator>
+
+</mujoco>

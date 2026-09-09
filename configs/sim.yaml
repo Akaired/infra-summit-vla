@@ -40,12 +40,15 @@ objects:
   plate: plate
   cup: cup
   bottle: bottle
+  mug: mug
   cutlery:
     - spoon_1
     - spoon_2
     - fork_1
     - fork_2
 
+
 viewer:
   enabled: false             # MuJoCo native viewer; off for headless eval runs
   offscreen_renderer: true
+
