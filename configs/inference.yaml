@@ -26,3 +26,10 @@ runtime:
 # Number of actions returned per inference call. >1 amortizes inference cost
 # across physics steps if per-step latency turns out too high.
 action_chunk_size: 1
+
+# TEMPORARY. No OpenVINO IR is exported yet, so InferenceRuntime delegates to
+# the model-free DummyPolicy in /policy. This block names that policy's config
+# instead of hardcoding the path in inference/runtime.py. Delete the whole
+# `stub:` block once `model.ir_xml` above points at a real exported IR.
+stub:
+  policy_config: configs/policy.yaml
