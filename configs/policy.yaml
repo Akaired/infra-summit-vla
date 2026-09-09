@@ -11,6 +11,16 @@
 base_policy: null
 pretrained_checkpoint: null
 
+# Interface smoke test only. Six controls per arm is a provisional layout;
+# confirm ordering/units with the simulator before integration.
+dummy:
+  seed: 0
+  controls_per_arm: 6
+  action_bounds: [-1.0, 1.0]  # dimensionless test values, not calibrated commands
+  smoke_image:
+    height: 480
+    width: 640
+
 dataset:
   # OPEN QUESTION (PRD 7.2): self-collected MuJoCo teleop vs an existing
   # LeRobot dataset close enough to fine-tune from.
@@ -31,3 +41,38 @@ export:
   onnx_path: outputs/export/policy.onnx
   openvino_ir_dir: outputs/export/openvino
   opset: 17
+
+
+# Engineer A's initial experiment.
+# This does not select the team's final production policy.
+experiment:
+  base_policy: smolvla
+  pretrained_checkpoint: lerobot/smolvla_base
+
+  # Resolve and record the exact Hugging Face commit before downloading.
+  pretrained_revision: "c83c3163b8ca9b7e67c509fffd9121e66cb96205"
+
+  # Relative to repository root; already ignored by Git.
+  local_model_dir: checkpoints/smolvla_base
+  smoke_test:
+    seed: 0
+    instruction: "open drawer"
+  dataset:
+    repo_id: lerobot/svla_so101_pickplace
+    revision: main
+    episodes: [0, 1, 2]
+
+    camera_map:
+      observation.images.up: observation.images.camera1
+      observation.images.side: observation.images.camera2
+
+    loader:
+      batch_size: 1
+      shuffle: true
+      seed: 0
+      num_workers: 0
+      video_backend: pyav
+
+  # Initial compatibility check runs on CPU.
+  # This is separate from the final OpenVINO device configuration.
+  device: cuda

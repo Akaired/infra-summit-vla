@@ -65,6 +65,9 @@ checkpoints/
 # directory, so a negation inside one would never match.
 data/*
 !data/.gitkeep
+!data/__init__.py
+!data/dataloader.py
+!data/check_dataset.py
 *.parquet
 *.hdf5
 *.h5

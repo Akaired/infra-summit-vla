@@ -6,14 +6,19 @@
 # generate a lockfile -- do not hand-maintain a second requirements.txt that can
 # drift from this file.
 #
-# No [build-system] yet: the modules are not importable packages until they have
-# real code. Add one (and __init__.py files) in the branch that needs it.
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools]
+packages = ["policy", "data"]
+
 
 [project]
 name = "infra-summit-vla"
 version = "0.1.0"
 description = "Bimanual VLA manipulation with multi-modal reasoning on dual SO-101 arms in MuJoCo, optimized with OpenVINO for Intel Core Ultra."
-requires-python = ">=3.10"
+requires-python = ">=3.12"
 dependencies = []
 
 [project.optional-dependencies]
@@ -22,7 +27,7 @@ sim = []
 
 # LeRobot fine-tuning / distillation, ONNX export (feature/policy-training)
 # Training only -- not needed on the Intel demo machine.
-policy = []
+policy = ["lerobot[smolvla, dataset]==0.6.1",]
 
 # OpenVINO runtime, IR conversion (feature/openvino-inference)
 # This is the group that must install cleanly on the Intel Core Ultra machine.
@@ -33,3 +38,27 @@ eval = []
 
 # Lint, format, test
 dev = []
+
+dummy = [
+    "numpy==2.2.6",
+    "PyYAML==6.0.2",
+    "Pillow==11.3.0",
+]
+
+cuda = [
+    "torch==2.11.0",
+    "torchvision==0.26.0",
+]
+
+[[tool.uv.index]]
+name = "pytorch-cu128"
+url = "https://download.pytorch.org/whl/cu128"
+explicit = true
+
+[tool.uv.sources]
+torch = [
+    { index = "pytorch-cu128", extra = "cuda" },
+]
+torchvision = [
+    { index = "pytorch-cu128", extra = "cuda" },
+]
