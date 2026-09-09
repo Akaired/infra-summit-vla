@@ -11,7 +11,7 @@ requires = ["setuptools>=68"]
 build-backend = "setuptools.build_meta"
 
 [tool.setuptools]
-packages = ["policy", "data"]
+packages = ["policy", "data", "inference"]
 
 
 [project]
@@ -36,7 +36,14 @@ policy = ["lerobot[smolvla, dataset]==0.6.1",]
 
 # OpenVINO runtime, IR conversion (feature/openvino-inference)
 # This is the group that must install cleanly on the Intel Core Ultra machine.
-inference = []
+# numpy / PyYAML are re-stated at the same pins as the `dummy` extra so the two
+# stay co-satisfiable (the stub imports policy.dummy_policy). The openvino pin
+# is not yet reflected in uv.lock -- see inference/README.md "Known gaps".
+inference = [
+    "openvino==2025.3.0",
+    "numpy==2.2.6",
+    "PyYAML==6.0.2",
+]
 
 # Eval harness + Intel benchmark (feature/eval-benchmark)
 eval = []

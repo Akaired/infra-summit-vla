@@ -18,8 +18,11 @@ and targeted at CPU / iGPU / NPU.
 
 > **Status: early build.** `/sim` has a placeholder dual-arm scene with full
 > domain randomization and a seed viewer; `/policy` has a SmolVLA-via-LeRobot
-> training/eval-smoke pipeline. `/inference` and `/eval` are still README-only.
-> The real SO-101 arm rig is not in the scene yet.
+> training/eval-smoke pipeline. `/inference` has a runnable stub — the
+> `(instruction, obs, state) -> action` runtime and the standalone Intel
+> benchmark, dummy-policy-backed until `/policy` exports an OpenVINO IR (branch
+> `feature/inference`). `/eval` is under parallel development (branch
+> `feature/eval`). The real SO-101 arm rig is not in the scene yet.
 
 ---
 
@@ -40,8 +43,8 @@ So: no cloud hosting on the graded path. Everything below runs locally.
 configs/      Single source of truth for paths, seeds, device, precision, checkpoints
 sim/          MuJoCo scene: dual SO-101 + dinner table, domain randomization
 policy/       LeRobot fine-tuning / distillation, export to ONNX -> OpenVINO IR
-inference/    OpenVINO runtime: IR loading, device selection, (instruction, obs, state) -> action
-eval/         Two entry points: 10-seed episode harness, and the standalone Intel benchmark
+inference/    OpenVINO runtime: IR loading, device selection, (instruction, obs, state) -> action; standalone Intel benchmark
+eval/         10-seed episode harness (steps physics, logs per-episode success + video)
 apps/web/     Optional local viewer for demo polish. Not graded, cut first.
 ```
 
@@ -69,9 +72,17 @@ python policy/dummy_policy.py --config configs/policy.yaml \
   --instruction "open drawer" --smoke-test
 ```
 
+```bash
+# /inference: runs on any CPU, no OpenVINO or Intel hardware needed
+python -m inference.runtime --config configs/inference.yaml --instruction "open the top drawer"
+python -m inference.benchmark --inference-config configs/inference.yaml --eval-config configs/eval.yaml
+python -m pytest inference/
+```
+
 Dependencies are only partially pinned: `pyproject.toml` still carries empty
-`sim` / `inference` / `eval` extras that get populated as each module stabilizes.
-The full command list lives in [`CLAUDE.md`](./CLAUDE.md#toolchain-and-commands).
+`sim` / `eval` extras that get populated as each module stabilizes, and the
+`inference` extra pins `openvino` but is not yet in `uv.lock`. The full command
+list lives in [`CLAUDE.md`](./CLAUDE.md#toolchain-and-commands).
 
 ## No hardcoded values
 
@@ -86,7 +97,7 @@ rejected in review. See [`configs/README.md`](./configs/README.md).
 |---|---|---|
 | 1 | Reproducible GitHub repository | this repo |
 | 2 | Reproducible MuJoCo simulation package | `sim/` + `configs/sim.yaml`, `configs/randomization.yaml` |
-| 3 | Intel inference benchmark script | `eval/` (standalone, no physics) + `configs/inference.yaml` |
+| 3 | Intel inference benchmark script | `inference/benchmark.py` (standalone, no physics) + `configs/inference.yaml`, `configs/eval.yaml:benchmark` |
 | 4 | Demonstration video across 10 randomized seeds | `eval/` harness output |
 | 5 | Technical readme / architecture summary | this file, expanded before submission |
 
