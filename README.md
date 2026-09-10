@@ -19,9 +19,11 @@ and targeted at CPU / iGPU / NPU.
 > **Status: early build.** `/sim` has a placeholder dual-arm scene with full
 > domain randomization and a seed viewer; `/policy` has a SmolVLA-via-LeRobot
 > training/eval-smoke pipeline; `/eval` has the 10-seed episode harness, driven
-> by a dummy policy until the real runtime lands. The standalone Intel benchmark
-> (`/eval` deliverable #3) and `/inference` are still README-only.
-> The real SO-101 arm rig is not in the scene yet.
+> by a dummy policy until the real runtime lands. `/inference` has a runnable
+> stub — the `(instruction, obs, state) -> action` runtime and the standalone
+> Intel benchmark (`inference/benchmark.py`), dummy-policy-backed until `/policy`
+> exports an OpenVINO IR. The real SO-101 arm rig is not in the scene yet, and
+> no OpenVINO IR exists yet.
 
 ---
 
@@ -73,6 +75,11 @@ python policy/dummy_policy.py --config configs/policy.yaml \
 # /eval: 10-seed episode harness (reuses the /sim deps above)
 python eval/run_episodes.py --config configs/eval.yaml   # writes outputs/eval/
 pytest eval/test_harness.py                              # loop runs without crashing
+
+# /inference: runs on any CPU, no OpenVINO or Intel hardware needed
+python -m inference.runtime --config configs/inference.yaml --instruction "open the top drawer"
+python -m inference.benchmark --inference-config configs/inference.yaml --eval-config configs/eval.yaml
+python -m pytest inference/
 ```
 
 Dependencies are only partially pinned: `pyproject.toml` still carries empty
@@ -92,7 +99,7 @@ rejected in review. See [`configs/README.md`](./configs/README.md).
 |---|---|---|
 | 1 | Reproducible GitHub repository | this repo |
 | 2 | Reproducible MuJoCo simulation package | `sim/` + `configs/sim.yaml`, `configs/randomization.yaml` |
-| 3 | Intel inference benchmark script | `eval/` (standalone, no physics) + `configs/inference.yaml` |
+| 3 | Intel inference benchmark script | `inference/benchmark.py` (standalone, no physics) + `configs/inference.yaml`, `configs/eval.yaml:benchmark` |
 | 4 | Demonstration video across 10 randomized seeds | `eval/` harness output |
 | 5 | Technical readme / architecture summary | this file, expanded before submission |
 
