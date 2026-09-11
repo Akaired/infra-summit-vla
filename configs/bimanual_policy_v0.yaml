@@ -1,0 +1,69 @@
+base:
+  checkpoint_dir: checkpoints/smolvla_base
+  revision: c83c3163b8ca9b7e67c509fffd9121e66cb96205
+
+output:
+  checkpoint_dir: checkpoints/bimanual-v0
+  manifest_file: manifest.json
+  preprocessor_file: policy_preprocessor.json
+  postprocessor_file: policy_postprocessor.json
+
+runtime:
+  device: cuda
+
+inputs:
+  state:
+    feature_key: observation.state
+    shape: [12]
+    dtype: float32
+    units: radians
+
+  cameras:
+    - name: overhead
+      feature_key: observation.images.overhead
+      shape: [3, 256, 256]
+      color_space: RGB
+      dtype: float32
+    - name: wrist_left
+      feature_key: observation.images.wrist_left
+      shape: [3, 256, 256]
+      color_space: RGB
+      dtype: float32
+    - name: wrist_right
+      feature_key: observation.images.wrist_right
+      shape: [3, 256, 256]
+      color_space: RGB
+      dtype: float32
+
+  instruction: "Open the top drawer."
+
+action:
+  feature_key: action
+  shape: [12]
+  dtype: float32
+  semantics: absolute_joint_position
+  units: radians
+  names:
+    - left_shoulder_pan
+    - left_shoulder_lift
+    - left_elbow_flex
+    - left_wrist_flex
+    - left_wrist_roll
+    - left_gripper
+    - right_shoulder_pan
+    - right_shoulder_lift
+    - right_elbow_flex
+    - right_wrist_flex
+    - right_wrist_roll
+    - right_gripper
+
+normalization:
+  state:
+    mean: 0.0
+    std: 1.0
+  action:
+    mean: 0.0
+    std: 1.0
+
+smoke_test:
+  seed: 0
