@@ -60,9 +60,7 @@ objects:
   bottle: bottle
   cutlery:
     - spoon_1
-    - spoon_2
     - fork_1
-    - fork_2
 
 
 viewer:

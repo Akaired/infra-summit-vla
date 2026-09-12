@@ -16,12 +16,12 @@ from ik_demo_utils import (
 model = mujoco.MjModel.from_xml_path("sim/assets/dinner_table_dual_so101.xml")
 data = mujoco.MjData(model)
 randomizer = DomainRandomizer(model, "configs/randomization.yaml")
-randomizer.reset(data, 10001)
+randomizer.reset(data, 10010)
 mujoco.mj_forward(model, data)
 
 bid = model.body("right_gripper").id
 OBJECTS = ["plate", "cup", "bottle",
-           "spoon_1", "spoon_2", "fork_1", "fork_2"]
+           "spoon_1", "fork_1"]
 
 ACTUATORS = ["left_shoulder_pan", "left_shoulder_lift",
              "left_elbow_flex", "left_wrist_flex",

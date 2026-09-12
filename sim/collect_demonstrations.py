@@ -22,7 +22,10 @@ sys.path.insert(0, "sim")
 sys.path.insert(0, ".")
 from randomization import DomainRandomizer  # noqa: E402
 from scripted_episode_ik import build_drawer_and_cutlery_episode  # noqa: E402
-from ik_demo_utils import activate_grasp_connect, deactivate_grasp_connect  # noqa: E402
+from ik_demo_utils import (  # noqa: E402
+    activate_grasp_connect, deactivate_grasp_connect,
+    activate_grasp_weld, deactivate_grasp_weld,
+)
 
 MODEL_PATH = "sim/assets/dinner_table_dual_so101.xml"
 RANDOMIZATION_CFG = "configs/randomization.yaml"
@@ -111,6 +114,30 @@ def _apply_qpos_to_ctrl(model, data, qpos):
         data.ctrl[act_id] = qpos[qpos_adr]
 
 
+def _find_plate_release_step(gripper_trace):
+    """Return the control-step index where the LEFT gripper transitions from
+    closed (<0) to open (>0). That is the moment the plate is put down and
+    the weld constraint must be released. Returns None if the gripper never
+    reopens (which is the case when the episode ends while still holding the
+    plate -- the release then simply never fires, which is fine, the weld
+    stays active to the end of the recorded trajectory).
+
+    Mirrors the identical scan in test_phases.py so both code paths find the
+    same event.
+    """
+    prev_left_val = None
+    for i, g in enumerate(gripper_trace):
+        if g is None:
+            continue
+        side, val = g
+        if side != "left":
+            continue
+        if prev_left_val is not None and prev_left_val < 0.0 and val > 0.0:
+            return i
+        prev_left_val = val
+    return None
+
+
 def collect(n_episodes, repo_id, root, instruction, control_decimation=10, seed_offset=0):
     model = mujoco.MjModel.from_xml_path(MODEL_PATH)
     data = mujoco.MjData(model)
@@ -127,6 +154,14 @@ def collect(n_episodes, repo_id, root, instruction, control_decimation=10, seed_
         robot_type="dual_so101",
         use_videos=True,
     )
+
+    # Precompute body IDs once -- identical for every episode since the model
+    # is not rebuilt.
+    left_gripper_bodies = {
+        model.body("left_gripper").id,
+        model.body("left_moving_jaw_so101_v1").id,
+    }
+    plate_bid = model.body("plate").id
 
     seed_rng = np.random.RandomState(seed_offset)
     used_seeds = []
@@ -145,8 +180,18 @@ def collect(n_episodes, repo_id, root, instruction, control_decimation=10, seed_
         qpos_trace, gripper_trace, grasp_events = build_drawer_and_cutlery_episode(
             model, data, randomizer
         )
+
+        # Locate the plate release step for THIS episode's gripper_trace.
+        plate_open_step = _find_plate_release_step(gripper_trace)
+
+        # Weld fires on first physical contact between a left-gripper body
+        # and the plate -- the exact same trigger test_phases.py uses. The
+        # armed flag is per-episode.
+        plate_weld_armed = True
+
         print(f"[collect] trajectory: {len(qpos_trace)} steps, "
-              f"cutlery-in-drawer={sorted(randomizer.last_in_drawer_items)}")
+              f"cutlery-in-drawer={sorted(randomizer.last_in_drawer_items)}, "
+              f"plate_release_step={plate_open_step}")
 
         for step_idx in range(len(qpos_trace)):
             _apply_qpos_to_ctrl(model, data, qpos_trace[step_idx])
@@ -160,6 +205,7 @@ def collect(n_episodes, repo_id, root, instruction, control_decimation=10, seed_
                 side, val = gval
                 data.ctrl[model.actuator(f"{side}_gripper").id] = val
 
+            # --- Right arm: drawer handle connect ------------------------
             if step_idx == grasp_events["activate_step"]:
                 handle_world_now = data.geom_xpos[model.geom("drawer_handle").id].copy()
                 activate_grasp_connect(model, data, grasp_events["eq_name"],
@@ -167,6 +213,28 @@ def collect(n_episodes, repo_id, root, instruction, control_decimation=10, seed_
                                         handle_world_now)
             if step_idx == grasp_events["deactivate_step"]:
                 deactivate_grasp_connect(model, data, grasp_events["eq_name"])
+
+            # --- Left arm: plate WELD, on first contact ------------------
+            # The moving jaw's convex-hull collision cannot retain a flat
+            # plate under load (verified -- the plate slips out sideways).
+            # A 6-DOF weld locks plate to left_gripper the instant fingers
+            # touch it, using the same mechanism as the drawer handle but
+            # with weld instead of connect (plate is a free 6-DOF body, not
+            # on a slide).
+            if plate_weld_armed:
+                for c in range(data.ncon):
+                    con = data.contact[c]
+                    b1 = int(model.geom_bodyid[con.geom1])
+                    b2 = int(model.geom_bodyid[con.geom2])
+                    if ((b1 in left_gripper_bodies and b2 == plate_bid)
+                            or (b2 in left_gripper_bodies and b1 == plate_bid)):
+                        activate_grasp_weld(model, data, "left_grasp_weld",
+                                             "left_gripper", "plate")
+                        plate_weld_armed = False
+                        break
+
+            if plate_open_step is not None and step_idx == plate_open_step:
+                deactivate_grasp_weld(model, data, "left_grasp_weld")
 
             for _ in range(control_decimation):
                 mujoco.mj_step(model, data)

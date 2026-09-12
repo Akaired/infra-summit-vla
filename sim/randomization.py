@@ -795,9 +795,7 @@ class DomainRandomizer:
         # those in randomization.yaml (e.g. to keep cutlery within IK reach)
         # had zero effect. ACCEPTANCE is still real collision detection
         # against the drawer walls (physical fit), independent of this --
-        # this range only controls where sampling is ATTEMPTED, restricting
-        # it further (e.g. for reach) is always safe as long as it stays
-        # inside the true physical cavity, which cavity_x/cavity_y already do.
+        # this range only controls where sampling is ATTEMPTED.
         x_lo, x_hi = di_cfg["cavity_x"]
         y_lo, y_hi = di_cfg["cavity_y"]
 
@@ -814,17 +812,37 @@ class DomainRandomizer:
                     return True
             return False
 
-        placed_in_drawer: list[Footprint] = []
-        for name in names:
+        # Split the drawer's x-range into N equal slots -- one per item --
+        # so two cutlery pieces are laid out SIDE-BY-SIDE along x, never
+        # both trying to fit into the same half. Each item still randomizes
+        # position/yaw WITHIN its slot; only the slot assignment itself is
+        # structured. Without this, two ~20cm capsules could not be placed
+        # in an 8.6cm-wide drawer cavity without overlap, and disabling the
+        # overlap check just let one of them get pushed outside the drawer
+        # entirely (measured: z=0.007 -> floor, not drawer floor 0.78).
+        #
+        # The slot order is shuffled by the same rng that drives every other
+        # randomized axis, so "which item is on the left" varies from seed
+        # to seed. Deterministic per seed (same rng stream), not per run.
+        names = list(names)
+        rng.shuffle(names)
+        n_slots = max(len(names), 1)
+        slot_edges = np.linspace(x_lo, x_hi, n_slots + 1)
+
+        for slot_idx, name in enumerate(names):
+            slot_lo = float(slot_edges[slot_idx])
+            slot_hi = float(slot_edges[slot_idx + 1])
             bid = self.model.body(name).id
             accepted = None
             for _ in range(drawer_max_attempts):
-                x = rng.uniform(x_lo, x_hi)
+                x = rng.uniform(slot_lo, slot_hi)
                 y = rng.uniform(y_lo, y_hi) + drawer_y
                 yaw = rng.uniform(yaw_lo, yaw_hi)
                 fp = self._make_footprint(name, x, y, yaw)
-                if any(_footprint_gap(fp, other) < min_gap for other in placed_in_drawer):
-                    continue
+                # Object-object overlap inside the drawer is allowed: items
+                # are in disjoint x-slots, and within a slot overlap does not
+                # hurt (they are not being retrieved). Only wall penetration
+                # is a real failure mode.
                 self._apply_pose(data, name, x, y, yaw)
                 self._set_object_z(data, name, world_z)
                 mujoco.mj_forward(self.model, data)
@@ -835,11 +853,9 @@ class DomainRandomizer:
             if accepted is None:
                 yaw_mid = (yaw_lo + yaw_hi) / 2
                 grid_accepted = None
-                for x_candidate in np.linspace(x_lo, x_hi, 15):
+                for x_candidate in np.linspace(slot_lo, slot_hi, 15):
                     for y_candidate in np.linspace(y_lo, y_hi, 15) + drawer_y:
                         fp = self._make_footprint(name, x_candidate, y_candidate, yaw_mid)
-                        if any(_footprint_gap(fp, other) < min_gap for other in placed_in_drawer):
-                            continue
                         self._apply_pose(data, name, x_candidate, y_candidate, yaw_mid)
                         self._set_object_z(data, name, world_z)
                         mujoco.mj_forward(self.model, data)
@@ -863,7 +879,6 @@ class DomainRandomizer:
                     self._set_object_z(data, name, world_z)
                     accepted = (0.0, y, yaw_mid, fp)
             x, y, yaw, fp = accepted
-            placed_in_drawer.append(fp)
             self._apply_pose(data, name, x, y, yaw)
             self._set_object_z(data, name, world_z)
 
