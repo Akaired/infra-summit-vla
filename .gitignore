@@ -105,3 +105,24 @@ Thumbs.db
 .idea/
 .vscode/
 *.swp
+
+# Handoff cleanup: files removed from tracking (kept on disk locally)
+# ---------------------------------------------------------------------------
+# Diagnostics (kept locally for reference, not shipped)
+grab_pose.py
+test_ik.py
+test_ik_episode.py
+test_ik_right_diag.py
+test_interp_objects.py
+test_reach_map.py
+test_render.py
+
+# Non-essential docs and archives
+*.pdf
+*.zip
+*.part
+
+# Scene preview renders (regenerated on demand)
+sim/overhead_view.png
+sim/wrist_left_view.png
+sim/wrist_right_view.png
