@@ -26,8 +26,18 @@ placement:
     min_items_in_drawer: 2
     max_items_in_drawer: 2
     world_y_center_closed_m: 0.24
-    cavity_x: [-0.043, 0.043]
-    cavity_y: [-0.035, 0.015]
+    # The X range for each item's CENTER is computed at runtime from the
+    # item's own flat-frame vertex extent (see _place_in_drawer and
+    # _compute_flat_orientations in randomization.py). A static cavity_x
+    # cannot work here: the cutlery meshes are NOT centered on their body
+    # origin (fork_1's collision mesh spans flat-frame x in
+    # [-0.0656, +0.1333], so its origin sits ~3cm off-center), which means
+    # the safe center-x window differs per item and cannot be guessed in
+    # advance. No `cavity_x` key is read anymore; the value is dropped.
+    # cavity_y is still read: split into N equal bands (one per item) so
+    # two ~20cm cutlery pieces go front-to-back rather than trying to
+    # share one X band and poking through the drawer side walls.
+    cavity_y: [-0.030, 0.030]
     cavity_yaw: [-0.25, 0.25]
     cavity_floor_local_z: -0.028
 
@@ -37,7 +47,7 @@ objects:
     shape: circle
     radius_m: 0.089
     x: [-0.32, -0.02]              # left half, reachable by left arm
-    y: [-0.22, -0.11]              # front edge, clear of drawer sweep
+    y: [-0.21, -0.089]              # front edge, clear of drawer sweep
     yaw: [-0.3, 0.3]
 
   cup:

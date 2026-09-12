@@ -26,6 +26,24 @@ def _geoms_by_body_prefix(model, prefix):
 
 
 def get_avoidance_limits(model, exclude_body=None):
+    # NOTE: deliberately does NOT include "table" -- the plate rim itself
+    # sits only 1-2cm above the table surface (measured: rim mid-thickness
+    # is 4-9mm above the plate's CoM, table top is ~9mm below that), so any
+    # avoidance limit against the table with a few-cm minimum distance would
+    # make the grasp itself unreachable. Table clearance during TRANSIT is
+    # instead guaranteed explicitly by TRANSIT_Z in scripted_episode_ik.py
+    # (verified >3cm above the tallest fixed obstacle) rather than via this
+    # soft velocity-limiting constraint, which can't distinguish "near table
+    # because grasping" from "near table because transiting badly".
+    #
+    # minimum_distance_from_collisions raised from 0.015 to 0.03 (3cm) for
+    # bottle/cup/drawer/plate -- this IS a global change (every IK solve,
+    # both arms), addressing the measured bottle/cup transit clearance
+    # requirement. The wrist camera mount (left_wrist_camera_mount,
+    # left_wrist_camera, children of left_gripper) is already covered here:
+    # `left_geoms` below is built by "left_" body-name PREFIX match, which
+    # catches the camera bodies along with the rest of the arm -- no
+    # separate camera-specific limit is needed, they get the same 3cm.
     tall_objects = ["bottle", "bowl", "plate", "cup", "drawer"]
     skip_geoms = {"drawer_handle"}
 
@@ -49,8 +67,8 @@ def get_avoidance_limits(model, exclude_body=None):
         lim = mink.CollisionAvoidanceLimit(
             model,
             geom_pairs=[(arm_geoms, obj_geoms)],
-            minimum_distance_from_collisions=0.015,
-            collision_detection_distance=0.05,
+            minimum_distance_from_collisions=0.03,
+            collision_detection_distance=0.08,
         )
         limits.append(lim)
 
@@ -155,16 +173,70 @@ def _rotation_from_a_to_b(a, b):
     return np.eye(3) + vx + vx @ vx * ((1 - c) / (s ** 2))
 
 
+def _plate_surface_z_range_at_xy(model, data, plate_bid, world_xy, xy_tolerance=0.004):
+    """Return (z_min, z_max) of the plate's collision-mesh material within
+    xy_tolerance (in world XY) of world_xy, or None if no mesh vertex is
+    that close in XY.
+
+    Used by compute_plate_rim_grasp to find the actual material surface at a
+    rim point. This is required because the plate is NOT a uniform-thickness
+    disc: measured radial profile shows material at r=0.9R sits at z_rel
+    +2.95..+11.59 mm above the body origin, while material at r=0.5R sits at
+    z_rel -9.79..-4.60 mm -- a ~16 mm vertical difference between rim and
+    center. The plate body origin (== the z used by `plate_z = xpos.z`) sits
+    between them, so positioning the gripper site at plate_z puts it under
+    the rim material (top jaw inside the plate) and above the center
+    material (both jaws in the air). Measured the hard way: robot touched
+    the plate with the TIP of the bottom jaw while the gripper was still
+    open, then the weld fired and the plate rode the tip. This helper gives
+    the caller the mid-thickness of the actual material at the rim point, so
+    the closing axis runs through the plate's substance.
+    """
+    plate_pos = data.xpos[plate_bid].copy()
+    plate_R = np.zeros(9)
+    mujoco.mju_quat2Mat(plate_R, data.xquat[plate_bid])
+    plate_R = plate_R.reshape(3, 3)
+
+    all_verts = []
+    for gid in range(model.ngeom):
+        if model.geom_bodyid[gid] != plate_bid:
+            continue
+        if model.geom_type[gid] != mujoco.mjtGeom.mjGEOM_MESH:
+            continue
+        mid = model.geom_dataid[gid]
+        v = model.mesh_vert[model.mesh_vertadr[mid]:
+                            model.mesh_vertadr[mid] + model.mesh_vertnum[mid]]
+        gpos = model.geom_pos[gid]
+        gquat = model.geom_quat[gid]
+        gr = np.zeros(9)
+        mujoco.mju_quat2Mat(gr, gquat)
+        gr = gr.reshape(3, 3)
+        all_verts.append((gr @ v.T).T + gpos)
+    if not all_verts:
+        return None
+    V = np.concatenate(all_verts, axis=0)
+    world = (plate_R @ V.T).T + plate_pos
+
+    dx = world[:, 0] - world_xy[0]
+    dy = world[:, 1] - world_xy[1]
+    rr = np.sqrt(dx * dx + dy * dy)
+    mask = rr < xy_tolerance
+    if mask.sum() == 0:
+        return None
+    return float(world[mask, 2].min()), float(world[mask, 2].max())
+
+
 def compute_plate_rim_grasp(model, data, configuration, plate_center_xy, left_base_xy,
                              plate_radius, plate_z, closing_axis_local, arm_joint_names,
                              gripper_frame_name, home_stage_xyz, rim_fraction=0.9,
                              outside_margin=0.06, sweep_steps_per_segment=15, phi_step_deg=15,
-                             grasp_side="near", max_orientation_error_deg=25.0):
+                             grasp_side="near", max_orientation_error_deg=25.0,
+                             plate_body_name="plate"):
     """Find the plate-rim grasp point + orientation for THIS episode's actual
     plate position. Pinches the rim vertically (closing_axis_local -> world Z)
-    so the jaws squeeze the plate's top/bottom surface at the rim (thin, ~1.5cm,
-    well within the gripper's ~4cm mouth) instead of the flat center (which
-    slips under load).
+    so the jaws squeeze the plate's top/bottom surface at the rim (thin, well
+    within the gripper's mouth) instead of the flat center (which slips under
+    load).
 
     IMPORTANT, learned the hard way on the real robot mesh: the left arm is
     only 5-DOF (5 revolute joints + gripper). A fully-specified 6D target
@@ -201,7 +273,19 @@ def compute_plate_rim_grasp(model, data, configuration, plate_center_xy, left_ba
     of the 5-DOF arm, not a bug; if every candidate gets rejected, that
     seed's plate position may need `grasp_side="far"` or a smaller
     `rim_fraction` (closer to center, shorter reach) instead.
+
+    The grasp z is placed at the MID-THICKNESS of the plate material at the
+    rim point, not at plate_z (which is the plate body's CoM z). These are
+    NOT the same: the plate has a raised rim (r=0.9R material is ~7 mm above
+    CoM, r=0.5R material is ~7 mm below), so using plate_z as the site z
+    puts the closing axis through the wrong plane. Measured consequence:
+    tip-of-jaw-only contact while the gripper was open, then weld fired and
+    the plate rode the tip. `plate_z` is kept as a fallback for cases where
+    the mesh query finds no nearby vertices (should not happen for a
+    well-formed plate, but a wrong-but-close z is better than a crash).
     """
+    plate_bid = model.body(plate_body_name).id
+
     to_base = left_base_xy - plate_center_xy
     to_base_dir = to_base / np.linalg.norm(to_base)
     if grasp_side == "far":
@@ -209,7 +293,21 @@ def compute_plate_rim_grasp(model, data, configuration, plate_center_xy, left_ba
     elif grasp_side != "near":
         raise ValueError(f"grasp_side must be 'near' or 'far', got {grasp_side!r}")
     rim_xy = plate_center_xy + rim_fraction * plate_radius * to_base_dir
-    rim_xyz = np.array([rim_xy[0], rim_xy[1], plate_z])
+
+    surface = _plate_surface_z_range_at_xy(model, data, plate_bid, rim_xy)
+    if surface is not None:
+        z_lo, z_hi = surface
+        rim_z = 0.5 * (z_lo + z_hi)
+    else:
+        # Mesh query found no vertices within xy_tolerance of the rim
+        # point. Fall back to the CoM z passed in by the caller -- worse,
+        # but still a valid position, and lets the sweep run rather than
+        # crashing the whole collection pass.
+        print(f"[compute_plate_rim_grasp] no plate mesh vertices within "
+              f"xy_tolerance of rim point {rim_xy}; falling back to "
+              f"plate_z={plate_z:.4f}")
+        rim_z = float(plate_z)
+    rim_xyz = np.array([rim_xy[0], rim_xy[1], rim_z])
     outside_xyz = rim_xyz + outside_margin * np.array([to_base_dir[0], to_base_dir[1], 0.0])
 
     q0 = configuration.q.copy()
@@ -229,8 +327,8 @@ def compute_plate_rim_grasp(model, data, configuration, plate_center_xy, left_ba
             cfg.update(q0)
             waypoints = [
                 (gripper_frame_name, home_stage_xyz, None, 1.2, None),
-                (gripper_frame_name, outside_xyz, quat, 1.2, "plate"),
-                (gripper_frame_name, rim_xyz, quat, 1.2, "plate"),
+                (gripper_frame_name, outside_xyz, quat, 1.2, plate_body_name),
+                (gripper_frame_name, rim_xyz, quat, 1.2, plate_body_name),
             ]
             try:
                 waypoint_sequence(cfg, model, waypoints, steps_per_segment=sweep_steps_per_segment)
@@ -257,36 +355,96 @@ def compute_plate_rim_grasp(model, data, configuration, plate_center_xy, left_ba
         )
     _, pos_err_cm, angle_from_vertical_deg, quat = best
 
-    # IMPORTANT: scripted_episode_ik.py's actual tail waypoints pass
-    # target_quat=None (not the quat returned here) -- an earlier attempt to
-    # use it directly made the 5-DOF arm sacrifice position for orientation
-    # in at least one case (~8cm miss). Because of that, the sweep above
-    # (which DOES use quat to pick a good orientation) does not necessarily
-    # predict what the real, orientation-free execution will achieve. Found
-    # directly on seed 10012 (plate at world x=+0.25, far from the left base
-    # at x=-0.22, likely at or past this arm's reach limit): the sweep
-    # reported 4.5cm error, but replaying the REAL waypoints (target_quat=
-    # None) gave 13.4cm -- the arm never actually touched the plate, the
-    # weld never activated, and the "episode" silently did nothing.
-    #
-    # So: re-verify with the SAME target_quat=None path scripted_episode_ik.py
-    # actually uses, and return THAT number. This is the trustworthy signal
-    # for whether this specific (randomized) plate position is reachable at
-    # all -- use it to skip/flag episodes the same way SKIP_RETRIEVE already
-    # does for cutlery, rather than silently shipping a "successful-looking"
+    # IMPORTANT: scripted_episode_ik.py's tail waypoints may pass
+    # target_quat=None on the open-approach waypoints and plate_quat on the
+    # closed-gripper waypoints (with a lower ori_cost so the 5-DOF arm does
+    # not sacrifice position for orientation). The sweep above uses quat on
+    # ALL its waypoints, which is a stronger constraint than what actually
+    # executes -- so this function ALSO re-verifies with the SAME
+    # target_quat=None path the trajectory uses for its approach, and
+    # returns THAT number. It is the trustworthy signal for whether this
+    # specific (randomized) plate position is reachable at all -- use it to
+    # skip/flag episodes the same way SKIP_RETRIEVE already does for
+    # cutlery, rather than silently shipping a "successful-looking"
     # trajectory where the gripper never touched anything.
+    #
+    # The verify pass is wrapped in try/except because mink's QP solver can
+    # raise NoSolutionFound on genuinely infeasible seeds (e.g. plate placed
+    # past the arm's reach under a full collision-avoidance limit set). A
+    # single unreachable seed must not crash the whole dataset-collection
+    # run -- treat it as "plate unreachable", return 999.0, and let the
+    # caller (collect_demonstrations.py) skip this episode.
     verify_cfg = mink.Configuration(model)
     verify_cfg.update(q0)
     verify_waypoints = [
         (gripper_frame_name, home_stage_xyz, None, 1.2, None),
-        (gripper_frame_name, outside_xyz, None, 1.2, "plate"),
-        (gripper_frame_name, rim_xyz, None, 1.2, "plate"),
+        (gripper_frame_name, outside_xyz, None, 1.2, plate_body_name),
+        (gripper_frame_name, rim_xyz, None, 1.2, plate_body_name),
     ]
-    waypoint_sequence(verify_cfg, model, verify_waypoints, steps_per_segment=20)
-    verify_final = verify_cfg.get_transform_frame_to_world(gripper_frame_name, "site").translation()
-    true_pos_err_cm = float(np.linalg.norm(verify_final - rim_xyz) * 100)
+    try:
+        waypoint_sequence(verify_cfg, model, verify_waypoints, steps_per_segment=20)
+        verify_final = verify_cfg.get_transform_frame_to_world(
+            gripper_frame_name, "site"
+        ).translation()
+        true_pos_err_cm = float(np.linalg.norm(verify_final - rim_xyz) * 100)
+    except Exception as e:
+        print(f"[compute_plate_rim_grasp] verify pass failed "
+              f"({type(e).__name__}) -- treating plate as unreachable on this seed")
+        true_pos_err_cm = 999.0
 
     return rim_xyz, outside_xyz, quat, true_pos_err_cm, angle_from_vertical_deg
+
+
+def compute_plate_rim_grasp_adaptive(model, data, configuration, plate_center_xy, left_base_xy,
+                                      plate_radius, plate_z, closing_axis_local, arm_joint_names,
+                                      gripper_frame_name, home_stage_xyz,
+                                      max_angle_deg=15.0, max_pos_err_cm=3.0, **kwargs):
+    """Try several (rim_fraction, grasp_side) combinations and return the
+    first that clears BOTH the position and angle thresholds.
+
+    Measured directly on this rig (reachability grid, 150 cells over
+    x in [-0.35,0.05], y in [-0.25,0.05]): the FIXED default
+    (rim_fraction=0.9, grasp_side="near") achieves angle<10 in only 51/150
+    cells overall, and only 1/30 cells inside the declared plate range
+    x in [-0.32,-0.02], y in [-0.21,-0.089] -- 29/30 cells there sit in an
+    18.7-21 degree dead zone, a real kinematic attractor of the 5-DOF chain
+    at that specific rim point, not a bug (confirmed: bit-identical angle
+    across dt/step-count/ori_cost variations in earlier testing). Re-scanning
+    9 representative points spanning the declared range with a SMALL set of
+    (rim_fraction, grasp_side) alternatives found <4 degrees at every single
+    one -- the task is achievable, the fixed default parameterization was
+    simply the wrong choice, not a hard limit of the arm.
+
+    Order tried: (0.9,near) first (cheapest, matches old behavior when it
+    happens to work), then rim_fraction 0.65/0.5 with both sides. Returns as
+    soon as a combination clears both thresholds.
+    """
+    combos = [(0.9, "near"), (0.9, "far"), (0.65, "near"), (0.65, "far"),
+              (0.5, "near"), (0.5, "far")]
+    best = None
+    for rim_frac, side in combos:
+        cfg = mink.Configuration(model)
+        cfg.update(configuration.q.copy())
+        try:
+            rim_xyz, outside_xyz, quat, pos_err_cm, angle_deg = compute_plate_rim_grasp(
+                model, data, cfg,
+                plate_center_xy=plate_center_xy, left_base_xy=left_base_xy,
+                plate_radius=plate_radius, plate_z=plate_z,
+                closing_axis_local=closing_axis_local, arm_joint_names=arm_joint_names,
+                gripper_frame_name=gripper_frame_name, home_stage_xyz=home_stage_xyz,
+                rim_fraction=rim_frac, grasp_side=side,
+                max_orientation_error_deg=90.0, **kwargs,
+            )
+        except RuntimeError:
+            continue
+        if best is None or (pos_err_cm + 0.3 * angle_deg) < (best[3] + 0.3 * best[4]):
+            best = (rim_xyz, outside_xyz, quat, pos_err_cm, angle_deg, rim_frac, side)
+        if pos_err_cm <= max_pos_err_cm and angle_deg <= max_angle_deg:
+            return rim_xyz, outside_xyz, quat, pos_err_cm, angle_deg, rim_frac, side
+
+    if best is None:
+        raise RuntimeError("compute_plate_rim_grasp_adaptive: every combination failed to converge.")
+    return best
 
 
 def activate_grasp_connect(model, data, eq_name, body1_name, body2_name, world_anchor_pt):
@@ -378,7 +536,14 @@ def solve_ik_step(configuration, model, frame_name, target_xyz, target_quat=None
                   secondary_pos_cost=1.0, secondary_ori_cost=0.15):
     """Single IK step. If secondary_* is given, a second FrameTask pins
     that frame at the secondary target in every solve -- used for bimanual
-    ops where one arm moves and the other must hold its pose."""
+    ops where one arm moves and the other must hold its pose.
+
+    ori_cost is a soft weight: when the chain cannot satisfy position AND
+    orientation simultaneously (e.g. 5-DOF arm + 6-DOF target), a lower
+    ori_cost tells the QP to sacrifice orientation first and keep position.
+    Used by the plate-place phase to hold a vertical "sandwich" grasp while
+    still hitting the rim accurately.
+    """
     task = mink.FrameTask(
         frame_name=frame_name,
         frame_type=frame_type,
@@ -420,6 +585,7 @@ def solve_ik_step(configuration, model, frame_name, target_xyz, target_quat=None
 
 def waypoint_sequence(configuration, model, waypoints, steps_per_segment=20,
                       frame_type="site",
+                      ori_cost=0.15,
                       secondary_frame=None, secondary_xyz=None, secondary_quat=None,
                       secondary_pos_cost=1.0, secondary_ori_cost=0.15):
     """
@@ -430,6 +596,11 @@ def waypoint_sequence(configuration, model, waypoints, steps_per_segment=20,
     Side is inferred from the waypoint's frame name -- avoids the old bug
     where every gripper_trace value was applied to right_gripper only,
     silently leaving the left gripper uncommanded.
+
+    ori_cost is forwarded to solve_ik_step for every step in this call, so
+    a caller can dial down the orientation weight for a whole sequence (used
+    by the plate-place phase: hold the vertical sandwich grasp with
+    ori_cost=0.1 so the 5-DOF arm doesn't sacrifice rim position for it).
     """
     qpos_trace = []
     gripper_trace = []
@@ -460,6 +631,7 @@ def waypoint_sequence(configuration, model, waypoints, steps_per_segment=20,
                 configuration, model, frame_name, curr_target_xyz,
                 target_quat=target_quat, limits=limits,
                 n_iter=8, dt=0.01, frame_type=frame_type,
+                ori_cost=ori_cost,
                 secondary_frame=secondary_frame,
                 secondary_xyz=secondary_xyz,
                 secondary_quat=secondary_quat,

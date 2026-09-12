@@ -686,10 +686,25 @@ class DomainRandomizer:
         return abs(long_axis_world[2])
 
     def _compute_flat_orientations(self):
+        """For each cutlery item, choose the flat orientation (via the
+        settle test) and record, in that flat frame:
+          - _mesh_half_length / _mesh_radius (used by table-placement
+            footprint checks, unchanged),
+          - _flat_extent = (x_min, x_max, y_min, y_max): the actual vertex
+            bounding box in the flat frame, expressed relative to the body
+            ORIGIN -- NOT re-centered. This is the authoritative source for
+            drawer-interior x-range computation, because cutlery collision
+            meshes are not origin-centered (verified: fork_1 spans flat
+            x in [-0.0656, +0.1333], so its origin sits ~3.4cm off-center).
+            A centered half_length alone cannot describe how much the mesh
+            sticks out past the body origin, and placement based on it puts
+            the +x endpoint through the drawer wall.
+        """
         self._flat_quat = {}
         self._mesh_half_length = {}
         self._mesh_radius = {}
         self._long_eigvec = {}
+        self._flat_extent = {}
         for name in self._cutlery_names():
             verts = self._mesh_verts_for_body(name)
             c = verts - verts.mean(axis=0)
@@ -709,7 +724,20 @@ class DomainRandomizer:
             self._flat_quat[name] = chosen
             rot = np.zeros(9)
             mujoco.mju_quat2Mat(rot, chosen)
-            self.nominal.up_axis_world[name] = rot.reshape(3, 3) @ np.array([0.0, 0.0, 1.0])
+            R = rot.reshape(3, 3)
+            self.nominal.up_axis_world[name] = R @ np.array([0.0, 0.0, 1.0])
+
+            # Express vertices in the flat frame, keeping body-origin
+            # reference (no re-centering): this is what placement needs to
+            # know about how far the mesh extends from the origin in each
+            # direction along the flat X axis.
+            verts_flat = verts @ R.T
+            self._flat_extent[name] = (
+                float(verts_flat[:, 0].min()),
+                float(verts_flat[:, 0].max()),
+                float(verts_flat[:, 1].min()),
+                float(verts_flat[:, 1].max()),
+            )
 
     def true_capsule_endpoints(self, data, name):
         """Authoritative world-space endpoints of a cutlery item, computed
@@ -781,27 +809,50 @@ class DomainRandomizer:
         return set(selected[:cap])
 
     def _place_in_drawer(self, data, rng, names, max_attempts):
+        """Place each cutlery item inside the closed drawer.
+
+        Two structural choices, both driven by what the ACTUAL mesh geometry
+        supports (measured, not assumed):
+
+        1. Y-BANDING, not x-banding. Cutlery capsules lie flat along X
+           with their full length, ~20cm end-to-end. Two of them cannot
+           share an X band in a drawer whose inner X extent is only 22cm
+           wide: each item's endpoints would poke through the side walls
+           at x = +/- 0.110, every candidate would fail the wall check,
+           and the grid-fallback would warn "no valid slot left".
+           Y-banding puts them front-to-back, each with the full X extent
+           available.
+
+        2. COMPUTED X CENTER RANGE, not a config value. The cutlery
+           collision meshes are NOT centered on their body origin --
+           fork_1's flat-frame x extent is [-0.0656, +0.1333], so at body
+           origin x=0 its +x end sits at +0.1333 and immediately contacts
+           the right wall (inner face at +0.110). A static `cavity_x` in
+           yaml cannot express that: the safe center range differs per
+           item, and for fork_1 at origin it is [-0.0424, -0.0253]. So the
+           safe range is computed at placement time from the item's own
+           measured flat extents, with a small yaw-tilt buffer, and every
+           sample is guaranteed inside it.
+        """
         di_cfg = self.placement_cfg["drawer_interior"]
         drawer_y = di_cfg["world_y_center_closed_m"]
         yaw_lo, yaw_hi = di_cfg["cavity_yaw"]
         local_z = di_cfg["cavity_floor_local_z"]
         world_z = self.model.body("drawer").pos[2] + local_z
-        min_gap = self.placement_cfg["min_gap_between_objects_m"]
         drawer_max_attempts = max(max_attempts, 500)
 
-        # Sampling range comes from config (cavity_x/cavity_y), NOT hardcoded
-        # constants -- this was a real, previously-silent bug: the hardcoded
-        # values here ignored cavity_x/cavity_y entirely, so tightening
-        # those in randomization.yaml (e.g. to keep cutlery within IK reach)
-        # had zero effect. ACCEPTANCE is still real collision detection
-        # against the drawer walls (physical fit), independent of this --
-        # this range only controls where sampling is ATTEMPTED.
-        x_lo, x_hi = di_cfg["cavity_x"]
         y_lo, y_hi = di_cfg["cavity_y"]
 
         wall_names = ["drawer_wall_left", "drawer_wall_right",
                       "drawer_wall_back", "drawer_wall_front"]
         wall_geoms = {self.model.geom(n).id for n in wall_names}
+
+        # Inner side-wall faces are at x = +/- 0.110 (drawer_wall_left /
+        # drawer_wall_right: pos x = -/+0.113, size x = 0.003). Keep a 2mm
+        # safety margin from the nominal face so a contact is never
+        # generated even under mild mesh-inflation from shape_scale (which
+        # is a no-op for meshes, but stay conservative).
+        INNER_WALL_HALF_X = 0.108
 
         def hits_wall(body_id):
             for c in range(data.ncon):
@@ -812,37 +863,49 @@ class DomainRandomizer:
                     return True
             return False
 
-        # Split the drawer's x-range into N equal slots -- one per item --
-        # so two cutlery pieces are laid out SIDE-BY-SIDE along x, never
-        # both trying to fit into the same half. Each item still randomizes
-        # position/yaw WITHIN its slot; only the slot assignment itself is
-        # structured. Without this, two ~20cm capsules could not be placed
-        # in an 8.6cm-wide drawer cavity without overlap, and disabling the
-        # overlap check just let one of them get pushed outside the drawer
-        # entirely (measured: z=0.007 -> floor, not drawer floor 0.78).
-        #
-        # The slot order is shuffled by the same rng that drives every other
-        # randomized axis, so "which item is on the left" varies from seed
-        # to seed. Deterministic per seed (same rng stream), not per run.
+        # Y bands: one per item, split evenly across cavity_y. The order
+        # is shuffled by the same rng driving every other randomized axis
+        # (deterministic per seed, varies seed-to-seed).
         names = list(names)
         rng.shuffle(names)
         n_slots = max(len(names), 1)
-        slot_edges = np.linspace(x_lo, x_hi, n_slots + 1)
+        slot_edges = np.linspace(y_lo, y_hi, n_slots + 1)
 
         for slot_idx, name in enumerate(names):
             slot_lo = float(slot_edges[slot_idx])
             slot_hi = float(slot_edges[slot_idx + 1])
             bid = self.model.body(name).id
+
+            # Analytic safe X center range for this item, from its own
+            # measured flat-frame extents. yaw buffer accounts for the
+            # largest in-plane y-extent swinging into x by sin(max_yaw).
+            fx_min, fx_max, fy_min, fy_max = self._flat_extent[name]
+            max_abs_yaw = max(abs(yaw_lo), abs(yaw_hi))
+            yaw_buffer = max(abs(fy_min), abs(fy_max)) * abs(np.sin(max_abs_yaw))
+            safe_x_lo = -INNER_WALL_HALF_X - fx_min + yaw_buffer
+            safe_x_hi = INNER_WALL_HALF_X - fx_max - yaw_buffer
+
+            if safe_x_lo >= safe_x_hi:
+                # Item is physically wider than the drawer interior along
+                # x even at yaw=0 -- cannot happen for the shipped assets
+                # (verified: fork window ~1cm, spoon ~1cm), so surface it
+                # clearly if a future mesh trips it.
+                print(f"[randomization] WARNING: '{name}' flat-frame x extent "
+                      f"[{fx_min:.4f}, {fx_max:.4f}] leaves no room inside the "
+                      f"drawer; placing at the range midpoint.")
+                x_center = 0.5 * (safe_x_lo + safe_x_hi)
+                safe_x_lo = safe_x_hi = x_center
+
             accepted = None
             for _ in range(drawer_max_attempts):
-                x = rng.uniform(slot_lo, slot_hi)
-                y = rng.uniform(y_lo, y_hi) + drawer_y
+                x = rng.uniform(safe_x_lo, safe_x_hi)
+                y = rng.uniform(slot_lo, slot_hi) + drawer_y
                 yaw = rng.uniform(yaw_lo, yaw_hi)
                 fp = self._make_footprint(name, x, y, yaw)
                 # Object-object overlap inside the drawer is allowed: items
-                # are in disjoint x-slots, and within a slot overlap does not
-                # hurt (they are not being retrieved). Only wall penetration
-                # is a real failure mode.
+                # are in disjoint Y bands, and within a band overlap does
+                # not hurt (they are not being retrieved). Only wall
+                # penetration is a real failure mode.
                 self._apply_pose(data, name, x, y, yaw)
                 self._set_object_z(data, name, world_z)
                 mujoco.mj_forward(self.model, data)
@@ -851,10 +914,14 @@ class DomainRandomizer:
                 accepted = (x, y, yaw, fp)
                 break
             if accepted is None:
+                # Sampling within the analytic safe range should always
+                # succeed, so reaching here means the safe-range model is
+                # off. Fall back to a deterministic grid across the same
+                # safe range, still inside the y-band.
                 yaw_mid = (yaw_lo + yaw_hi) / 2
                 grid_accepted = None
-                for x_candidate in np.linspace(slot_lo, slot_hi, 15):
-                    for y_candidate in np.linspace(y_lo, y_hi, 15) + drawer_y:
+                for x_candidate in np.linspace(safe_x_lo, safe_x_hi, 15):
+                    for y_candidate in np.linspace(slot_lo, slot_hi, 15) + drawer_y:
                         fp = self._make_footprint(name, x_candidate, y_candidate, yaw_mid)
                         self._apply_pose(data, name, x_candidate, y_candidate, yaw_mid)
                         self._set_object_z(data, name, world_z)
@@ -867,13 +934,14 @@ class DomainRandomizer:
                         break
                 if grid_accepted is not None:
                     print(f"[randomization] drawer interior: '{name}' used "
-                          f"2D grid-search fallback after {drawer_max_attempts} random attempts")
+                          f"grid-search fallback after {drawer_max_attempts} "
+                          f"random attempts within its analytic safe range")
                     accepted = grid_accepted
                 else:
                     print(f"[randomization] WARNING: drawer interior has no "
-                          f"valid slot left for '{name}' -- cavity may be "
-                          f"over-subscribed for this seed's item count")
-                    y = drawer_y
+                          f"valid slot for '{name}' even within its computed "
+                          f"safe range -- cavity may be over-subscribed")
+                    y = 0.5 * (slot_lo + slot_hi) + drawer_y
                     fp = self._make_footprint(name, 0.0, y, yaw_mid)
                     self._apply_pose(data, name, 0.0, y, yaw_mid)
                     self._set_object_z(data, name, world_z)

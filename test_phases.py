@@ -16,13 +16,16 @@ from ik_demo_utils import (
 model = mujoco.MjModel.from_xml_path("sim/assets/dinner_table_dual_so101.xml")
 data = mujoco.MjData(model)
 randomizer = DomainRandomizer(model, "configs/randomization.yaml")
-randomizer.reset(data, 10010)
+SEED = int(sys.argv[1]) if len(sys.argv) > 1 else 8010
+randomizer.reset(data, SEED)
+print(f"=== SEED = {SEED} ===")
 mujoco.mj_forward(model, data)
 
-bid = model.body("right_gripper").id
-OBJECTS = ["plate", "cup", "bottle",
-           "spoon_1", "fork_1"]
+plate_bid = model.body("plate").id
+plate_pos = data.xpos[plate_bid].copy()
+print(f"plate start = ({plate_pos[0]:+.4f}, {plate_pos[1]:+.4f}, {plate_pos[2]:+.4f})")
 
+OBJECTS = ["plate", "cup", "bottle", "spoon_1", "fork_1"]
 ACTUATORS = ["left_shoulder_pan", "left_shoulder_lift",
              "left_elbow_flex", "left_wrist_flex",
              "left_wrist_roll", "left_gripper",
@@ -32,18 +35,18 @@ ACTUATORS = ["left_shoulder_pan", "left_shoulder_lift",
 
 start_xy = {n: data.xpos[model.body(n).id][:2].copy() for n in OBJECTS}
 start_z = {n: data.xpos[model.body(n).id][2] for n in OBJECTS}
-drawer_jid = model.joint("drawer_slide").id
-drawer_qadr = model.jnt_qposadr[drawer_jid]
+drawer_qadr = model.jnt_qposadr[model.joint("drawer_slide").id]
 drawer_start = data.qpos[drawer_qadr]
-
-print(f"Drawer start position: {drawer_start:.4f}\n")
 
 qpos_trace, gripper_trace, grasp_events = build_drawer_and_cutlery_episode(model, data, randomizer)
 print(f"Trajectory built: {len(qpos_trace)} steps")
 print(f"  plate_grasp_pos_err_cm = {grasp_events['plate_grasp_pos_err_cm']:.2f}")
 print(f"  plate_grasp_angle_deg  = {grasp_events['plate_grasp_angle_deg']:.2f}\n")
 
-# Left-arm plate grasp: release step (gripper reopens)
+# Commanded release step: where the LEFT gripper is commanded OPEN after
+# having been commanded CLOSED. Simplified spec: no site_z gate on when to
+# consider this "the" release step -- the actual weld deactivation timing
+# is handled below by the hard timeout / site_z<0.85 check.
 plate_open_step = None
 prev_left_val = None
 for i, g in enumerate(gripper_trace):
@@ -62,10 +65,9 @@ left_gripper_bodies = {
     model.body("left_gripper").id,
     model.body("left_moving_jaw_so101_v1").id,
 }
-plate_bid = model.body("plate").id
-plate_connect_armed = True
+plate_weld_armed = True
+plate_weld_released = False
 
-# Replay with live viewer
 viewer = mujoco.viewer.launch_passive(model, data)
 
 first_move = {}
@@ -85,7 +87,6 @@ for step in range(len(qpos_trace)):
         side, val = gval
         data.ctrl[model.actuator(f"{side}_gripper").id] = val
 
-    # Right arm grasp connect (drawer handle).
     if step == grasp_events["activate_step"]:
         handle_world_now = data.geom_xpos[model.geom("drawer_handle").id].copy()
         activate_grasp_connect(model, data, grasp_events["eq_name"],
@@ -94,8 +95,10 @@ for step in range(len(qpos_trace)):
     if step == grasp_events["deactivate_step"]:
         deactivate_grasp_connect(model, data, grasp_events["eq_name"])
 
-    # Left arm plate grasp: WELD, not connect.
-    if plate_connect_armed:
+    # NO GATES. Weld fires on ANY contact between any left-gripper body and
+    # the plate, regardless of gripper position. Per updated spec: we are
+    # not doing a clean rim grasp anymore, just glue-on-contact-and-carry.
+    if plate_weld_armed:
         for c in range(data.ncon):
             con = data.contact[c]
             b1 = int(model.geom_bodyid[con.geom1])
@@ -104,32 +107,36 @@ for step in range(len(qpos_trace)):
                     or (b2 in left_gripper_bodies and b1 == plate_bid)):
                 activate_grasp_weld(model, data, "left_grasp_weld",
                                      "left_gripper", "plate")
-                print(f"  [step {step}] plate WELD ACTIVATED at first contact")
-                plate_connect_armed = False
+                print(f"  [step {step}] plate WELD ACTIVATED (first contact, no gate)")
+                plate_weld_armed = False
                 break
 
-    if plate_open_step is not None and step == plate_open_step:
-        deactivate_grasp_weld(model, data, "left_grasp_weld")
-        print(f"  [step {step}] plate WELD DEACTIVATED (release)")
+    # Release when the commanded gripper value has gone to OPEN, with a
+    # HARD TIMEOUT: 40 steps after the open command, release unconditionally
+    # even if the site hasn't descended -- OR release early once site_z has
+    # dropped below 0.85. This replaces the old site_z<0.80-only gate, which
+    # could leave the weld active forever if the arm never got that low
+    # (observed: weld stuck active to end of episode, plate dragged home).
+    if plate_open_step is not None and step >= plate_open_step and not plate_weld_released:
+        steps_since_open = step - plate_open_step
+        site_z = data.site_xpos[model.site("left_gripperframe").id][2]
+        if steps_since_open >= 40 or site_z < 0.85:
+            deactivate_grasp_weld(model, data, "left_grasp_weld")
+            print(f"  [step {step}] plate WELD DEACTIVATED "
+                  f"(steps_since_open={steps_since_open}, site_z={site_z:.3f})")
+            plate_weld_released = True
 
     for _ in range(10):
         mujoco.mj_step(model, data)
     viewer.sync()
     time.sleep(0.005)
 
-    # Full diagnostic window: covers tail-phase, plate pick, and the extra
-    # 6-second hold phase (steps 360-659). Prints plate xyz at every sampled
-    # step so we can see whether the plate stays at lift height through the
-    # hold window (grasp retains) or drifts/falls (grasp fails).
     if step in (0, 100, 199, 200, 220, 240, 260, 280, 300, 320, 340,
                 360, 380, 400, 420, 440, 460, 480, 500, 520, 540, 560,
                 580, 600, 620, 640, 659):
         L_site = data.site_xpos[model.site("left_gripperframe").id]
-        R_site = data.site_xpos[model.site("right_gripperframe").id]
         plate_xyz = data.xpos[plate_bid]
-        print(f"step {step:4d}  drawer={data.qpos[drawer_qadr]:.3f}  "
-              f"R_site=[{R_site[0]:.3f} {R_site[1]:.3f} {R_site[2]:.3f}]  "
-              f"L_site=[{L_site[0]:.3f} {L_site[1]:.3f} {L_site[2]:.3f}]  "
+        print(f"step {step:4d}  L_site=[{L_site[0]:.3f} {L_site[1]:.3f} {L_site[2]:.3f}]  "
               f"plate=[{plate_xyz[0]:.3f} {plate_xyz[1]:.3f} {plate_xyz[2]:.3f}]")
 
     for n in OBJECTS:
@@ -139,32 +146,24 @@ for step in range(len(qpos_trace)):
         if shift > 0.03:
             first_move[n] = step
 
-viewer.close()
+# Verify the release actually happened. Never crash on this -- per spec,
+# print a warning and continue if it somehow never fired.
+if not plate_weld_released:
+    print(f"WARNING: weld never released on seed {SEED} -- forcing release now.")
+    deactivate_grasp_weld(model, data, "left_grasp_weld")
 
-print("\n=== STEP 3: first move of each object >3cm ===")
-if not first_move:
-    print("  no objects moved")
-else:
-    for n, step in first_move.items():
-        print(f"  {n} at step {step}")
-
-drawer_end = data.qpos[drawer_qadr]
-print(f"\n=== Drawer motion ===")
-print(f"  start: {drawer_start:.4f}  end: {drawer_end:.4f}  "
-      f"travel: {(drawer_end - drawer_start)*100:.2f} cm")
-
-print(f"\n=== Final object shifts (XY and Z separately) ===")
+print("")
+print("=== Final object shifts ===")
 for n in OBJECTS:
     end = data.xpos[model.body(n).id]
     xy_shift = float(np.linalg.norm(end[:2] - start_xy[n]))
     z_shift = float(end[2] - start_z[n])
-    print(f"  {n}: xy={xy_shift*100:6.1f}cm  z={z_shift*100:+6.2f}cm  "
-          f"final=[{end[0]:.3f} {end[1]:.3f} {end[2]:.3f}]")
+    print(f"  {n}: xy={xy_shift*100:6.1f}cm  z={z_shift*100:+6.2f}cm  final=[{end[0]:.3f} {end[1]:.3f} {end[2]:.3f}]")
 
-print("\n=== plate Z trajectory through hold phase ===")
-print("  (look at the step-by-step prints above: 360 to 659)")
-print(f"  plate final z: {data.xpos[plate_bid][2]:.4f}")
-
-print("\n=== cutlery position after replay ===")
-for n in sorted(randomizer.last_in_drawer_items):
-    print(f"  {n}: {data.xpos[model.body(n).id][:2]}")
+print("")
+print("Viewer open. Close the window or Ctrl+C to exit.")
+while viewer.is_running():
+    mujoco.mj_step(model, data)
+    viewer.sync()
+    time.sleep(0.01)
+viewer.close()
