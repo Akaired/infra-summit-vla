@@ -28,9 +28,9 @@ from randomization import (
     _footprint_gap,
 )
 
-TABLE_HALF_X = 0.5
-TABLE_HALF_Y = 0.35
-DRAWER_Y_CENTER = 0.27
+TABLE_HALF_X = 0.46
+TABLE_HALF_Y = 0.32
+DRAWER_Y_CENTER = 0.24
 DRAWER_HALF_Y = 0.08
 DRAWER_EXTRA_MARGIN = 0.03
 
@@ -57,21 +57,20 @@ def get_object_xy_yaw(model, data, name):
 
 
 def footprint_from_state(randomizer, model, data, name):
-    """Reconstructs an object's footprint from its ACTUAL current geometry
-    (via randomizer's own _placement_radius/_placement_half_length -- live
-    geom_size for primitives, post shape_scale), not the static yaml
-    radius_m. Using the static value here was a real test bug: shape_scale
-    can shrink a capsule up to 10% below nominal, and the real placement
-    check (correctly) validates against that true smaller size -- so a
-    static-radius reconstruction could show an artificially tight gap for
-    an object that was, in its real/current size, validly spaced."""
+    """Reconstructs an object's footprint from its ACTUAL current geometry.
+    For capsules (cutlery), uses randomizer.true_capsule_endpoints -- the
+    single authoritative source, computed directly from the real applied
+    quaternion and the real PCA long axis. An earlier version extracted an
+    abstract 'yaw' from the quaternion and recomposed via _capsule_endpoints;
+    that assumed the object's reference orientation was identity, which
+    broke once cutlery's real reference became the PCA flat quat (itself a
+    substantial rotation) -- the two reconstructions silently disagreed."""
     cfg = randomizer.object_cfg[name]
-    x, y, yaw = get_object_xy_yaw(model, data, name)
+    x, y, _ = get_object_xy_yaw(model, data, name)
     radius = randomizer._placement_radius(name)
     if cfg["shape"] == "circle":
         return Footprint(shape="circle", center=np.array([x, y]), radius=radius)
-    half_length = randomizer._placement_half_length(name)
-    p1, p2 = _capsule_endpoints(np.array([x, y]), yaw, half_length)
+    p1, p2 = randomizer.true_capsule_endpoints(data, name)
     return Footprint(shape="capsule", center=np.array([x, y]), radius=radius, p1=p1, p2=p2)
 
 
@@ -138,16 +137,19 @@ def check_placement_overlap(randomizer, model, data):
 
 def check_drawer_interior(randomizer, model, data):
     """For cutlery placed INSIDE the drawer this seed: verify it's actually
-    within the cavity bounds (not clipping through a wall) and doesn't
+    contained (real collision check against the drawer walls -- the same
+    proven mechanism _place_in_drawer itself uses to decide acceptance, not
+    an idealized capsule-endpoint-vs-boundary comparison) and doesn't
     overlap another in-drawer item.
 
-    Checks endpoints against the TRUE wall interior (from the MJCF:
-    drawer_floor/walls half-extent 0.114 x 0.074), not against
-    `drawer_interior.cavity_x/cavity_y` from the yaml -- those are CENTER
-    sampling ranges, deliberately tighter than the true cavity so a
-    capsule's half-length can extend beyond its center and still land
-    inside the real walls. Comparing an endpoint against the center range
-    would be comparing the wrong two things."""
+    An earlier version compared PCA-endpoint positions against the wall
+    coordinates directly; that over-reports violations for an asymmetric,
+    tapered mesh (a fork's tines don't fill a uniform capsule all the way to
+    its PCA-measured tip) -- the real physics found no contact for cases
+    the idealized model flagged as "outside". Checking real contacts is
+    what actually matters (does it visually/physically clip through a
+    wall), and is consistent with the mechanism already governing
+    acceptance during placement."""
     di_cfg = randomizer.placement_cfg.get("drawer_interior")
     if not di_cfg:
         return True, "OK (drawer_interior not configured)"
@@ -155,24 +157,20 @@ def check_drawer_interior(randomizer, model, data):
     if not names:
         return True, "OK (no cutlery in drawer this seed)"
 
-    drawer_y = di_cfg["world_y_center_closed_m"]
-    CAVITY_WALL_HALF_X, CAVITY_WALL_HALF_Y = 0.114, 0.074  # true interior, from the MJCF
-    wall_margin = 0.005
+    wall_names = ["drawer_wall_left", "drawer_wall_right", "drawer_wall_back", "drawer_wall_front"]
+    wall_geoms = {model.geom(n).id for n in wall_names}
     failures = []
-
-    footprints = {}
     for name in names:
-        fp = footprint_from_state(randomizer, model, data, name)
-        footprints[name] = fp
-        pts = [fp.p1, fp.p2] if fp.shape == "capsule" else [fp.center]
-        for pt in pts:
-            if not (-CAVITY_WALL_HALF_X + wall_margin <= pt[0] <= CAVITY_WALL_HALF_X - wall_margin):
-                failures.append(f"{name}: x={pt[0]:.4f} outside true cavity walls "
-                                 f"[{-CAVITY_WALL_HALF_X},{CAVITY_WALL_HALF_X}]")
-            y_lo_wall, y_hi_wall = drawer_y - CAVITY_WALL_HALF_Y, drawer_y + CAVITY_WALL_HALF_Y
-            if not (y_lo_wall + wall_margin <= pt[1] <= y_hi_wall - wall_margin):
-                failures.append(f"{name}: y={pt[1]:.4f} outside true cavity walls "
-                                 f"[{y_lo_wall},{y_hi_wall}]")
+        bid = model.body(name).id
+        for c in range(data.ncon):
+            con = data.contact[c]
+            g1, g2 = con.geom1, con.geom2
+            b1, b2 = model.geom_bodyid[g1], model.geom_bodyid[g2]
+            if bid in (b1, b2) and (g1 in wall_geoms or g2 in wall_geoms):
+                wname = mujoco.mj_id2name(model, mujoco.mjtObj.mjOBJ_GEOM, g1 if g1 in wall_geoms else g2)
+                failures.append(f"{name}: real contact with {wname} (dist={con.dist:.4f})")
+
+    footprints = {n: footprint_from_state(randomizer, model, data, n) for n in names}
 
     min_gap = randomizer.placement_cfg["min_gap_between_objects_m"]
     for i, a in enumerate(names):
@@ -227,7 +225,13 @@ def check_drawer_clearance(randomizer, model, data):
     return ok, "OK (cutlery clear of drawer zone)" if ok else "FAIL:\n    " + "\n    ".join(failures)
 
 
-def check_self_collision(model, data):
+def check_self_collision(model, data, max_penetration_m=0.001):
+    """Real overlap only -- not the small sub-mm 'touching' every resting
+    contact shows in MuJoCo's solver (that's the normal representation of
+    contact, not instability). Verified directly: the real SO-101's
+    equilibrium pose shows 8 left/right contacts, all under 0.3mm -- a
+    zero-tolerance check flags this every time despite nothing being
+    physically wrong."""
     left_geoms, right_geoms = set(), set()
     for gid in range(model.ngeom):
         bname = mujoco.mj_id2name(model, mujoco.mjtObj.mjOBJ_BODY, model.geom_bodyid[gid]) or ""
@@ -235,13 +239,15 @@ def check_self_collision(model, data):
             left_geoms.add(gid)
         elif bname.startswith("right_"):
             right_geoms.add(gid)
-    cross = sum(
-        1 for c in range(data.ncon)
-        if (data.contact[c].geom1 in left_geoms and data.contact[c].geom2 in right_geoms)
-        or (data.contact[c].geom1 in right_geoms and data.contact[c].geom2 in left_geoms)
-    )
-    ok = cross == 0
-    return ok, "OK" if ok else f"FAIL: {cross} left/right contacts"
+    real_hits = [
+        data.contact[c].dist for c in range(data.ncon)
+        if ((data.contact[c].geom1 in left_geoms and data.contact[c].geom2 in right_geoms)
+            or (data.contact[c].geom1 in right_geoms and data.contact[c].geom2 in left_geoms))
+        and data.contact[c].dist < -max_penetration_m
+    ]
+    ok = len(real_hits) == 0
+    msg = "OK" if ok else f"FAIL: {len(real_hits)} contacts deeper than {max_penetration_m*1000:.1f}mm (worst: {min(real_hits)*1000:.2f}mm)"
+    return ok, msg
 
 
 def reset_pre_settle(randomizer, model, data, seed):

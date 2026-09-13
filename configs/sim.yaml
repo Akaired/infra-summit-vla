@@ -6,7 +6,6 @@
 # a path, a body/joint name, or a camera name -- it comes from here.
 
 scene:
-  # TODO(feature/mujoco-scene): author the MJCF. Placeholder path.
   mjcf: sim/assets/dinner_table_dual_so101.xml
   asset_dir: sim/assets
 
@@ -32,7 +31,26 @@ robot:
   # Name prefixes used to resolve joints/actuators per arm in the MJCF.
   left_arm_prefix: left_
   right_arm_prefix: right_
-  home_qpos: null            # TODO: rest pose once the rig exists
+  # Measured gravity-equilibrium pose (not a guess) -- see
+  # randomization.py DomainRandomizer._compute_robot_equilibrium_pose.
+  # Recomputed for the real SO-101 (TheRobotStudio/SO-ARM100) after the
+  # placeholder-rig swap. Much smaller sag than the placeholder showed --
+  # the real STS3215 servo model uses kp=998 (vs. the placeholder's kp=15),
+  # so gravity droop is naturally far smaller. Order matches
+  # action_space.yaml `actuators`.
+  home_qpos:
+    left_shoulder_pan: 0.00000
+    left_shoulder_lift: 0.00062
+    left_elbow_flex: 0.00053
+    left_wrist_flex: 0.00014
+    left_wrist_roll: 0.00002
+    left_gripper: -0.00000
+    right_shoulder_pan: 0.00000
+    right_shoulder_lift: 0.00062
+    right_elbow_flex: 0.00053
+    right_wrist_flex: 0.00014
+    right_wrist_roll: 0.00002
+    right_gripper: -0.00000
 
 # Objects the dinner-table task manipulates. Names must match MJCF bodies.
 objects:
@@ -40,15 +58,11 @@ objects:
   plate: plate
   cup: cup
   bottle: bottle
-  mug: mug
   cutlery:
     - spoon_1
-    - spoon_2
     - fork_1
-    - fork_2
 
 
 viewer:
   enabled: false             # MuJoCo native viewer; off for headless eval runs
   offscreen_renderer: true
-

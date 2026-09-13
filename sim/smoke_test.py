@@ -64,9 +64,27 @@ def check_names(model, cfg):
     return ok
 
 
-def check_stability(model, data, n_steps=500):
-    print(f"\n--- Stability check ({n_steps} steps at rest, no control input) ---")
+def apply_home_qpos(model, data, cfg):
+    """Start from sim.yaml's measured home_qpos, not raw qpos0. qpos0 is
+    just wherever the MJCF's default joint values happen to land -- for the
+    real SO-101 (mid-range calibration), that's a curled-up pose where the
+    two arms visibly overlap (verified: up to 4.5cm penetration), not a
+    pose the system ever actually uses. DomainRandomizer.reset() always
+    moves to home_qpos immediately; checking self-collision/stability
+    anywhere else tests a state that doesn't matter and produces false
+    alarms on any future robot swap, exactly as it just did on this one."""
     mujoco.mj_resetData(model, data)
+    home = cfg.get("robot", {}).get("home_qpos")
+    if home:
+        for joint_name, value in home.items():
+            adr = model.jnt_qposadr[model.joint(joint_name).id]
+            data.qpos[adr] = value
+    mujoco.mj_forward(model, data)
+
+
+def check_stability(model, data, cfg, n_steps=500):
+    print(f"\n--- Stability check ({n_steps} steps from home_qpos, no control input) ---")
+    apply_home_qpos(model, data, cfg)
     for i in range(n_steps):
         mujoco.mj_step(model, data)
         if not np.all(np.isfinite(data.qpos)) or not np.all(np.isfinite(data.qvel)):
@@ -79,14 +97,12 @@ def check_stability(model, data, n_steps=500):
     return True
 
 
-def check_self_collision(model, data):
-    print("\n--- Left/right arm self-collision check at home pose ---")
-    mujoco.mj_resetData(model, data)
-    mujoco.mj_forward(model, data)
+def check_self_collision(model, data, cfg, max_penetration_m=0.001):
+    print("\n--- Left/right arm self-collision check at home_qpos ---")
+    apply_home_qpos(model, data, cfg)
     left_geoms = set()
     right_geoms = set()
     for i in range(model.ngeom):
-        name = mujoco.mj_id2name(model, mujoco.mjtObj.mjOBJ_GEOM, i)
         body_id = model.geom_bodyid[i]
         body_name = mujoco.mj_id2name(model, mujoco.mjtObj.mjOBJ_BODY, body_id) or ""
         if body_name.startswith("left_"):
@@ -94,16 +110,23 @@ def check_self_collision(model, data):
         elif body_name.startswith("right_"):
             right_geoms.add(i)
 
-    cross_contacts = 0
+    # Real overlap (more than max_penetration_m), not the small sub-mm
+    # "touching" every resting contact shows in MuJoCo's solver -- that's
+    # the normal representation of contact, not instability. Verified: the
+    # real SO-101's equilibrium pose shows 8 contacts, all under 0.3mm.
+    real_hits = []
     for c in range(data.ncon):
-        g1, g2 = data.contact[c].geom1, data.contact[c].geom2
+        con = data.contact[c]
+        g1, g2 = con.geom1, con.geom2
         if (g1 in left_geoms and g2 in right_geoms) or (g1 in right_geoms and g2 in left_geoms):
-            cross_contacts += 1
-    print(f"  cross left/right contacts at home pose: {cross_contacts}")
-    if cross_contacts > 0:
-        print("  FAIL: arms are colliding at rest -- widen the 1.1m base separation or check geometry.")
+            if con.dist < -max_penetration_m:
+                real_hits.append(con.dist)
+    print(f"  cross left/right contacts deeper than {max_penetration_m*1000:.1f}mm: {len(real_hits)}")
+    if real_hits:
+        print(f"  FAIL: real self-collision at home_qpos (worst: {min(real_hits)*1000:.2f}mm) "
+              f"-- widen base separation or check geometry.")
         return False
-    print("  OK: no self-collision between arms at home pose.")
+    print("  OK: no meaningful self-collision between arms at home_qpos.")
     return True
 
 
@@ -132,8 +155,8 @@ def main():
 
     results = {
         "name_contract": check_names(model, cfg),
-        "stability": check_stability(model, data),
-        "self_collision": check_self_collision(model, data),
+        "stability": check_stability(model, data, cfg),
+        "self_collision": check_self_collision(model, data, cfg),
         "camera_render": check_cameras_render(model, data),
     }
 

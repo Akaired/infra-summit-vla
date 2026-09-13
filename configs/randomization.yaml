@@ -1,202 +1,100 @@
-# Domain randomization ranges and the evaluation seed list.
-# Owned by: feature/mujoco-scene
-# Consumed by: /sim (applies the randomization) and /eval (iterates the seeds).
-#
-# Shared deliberately: the brief requires results across 10 randomized seeds,
-# so the seed list must have exactly one definition in the repo.
-
-# Deliverable #4 requires 10 randomized environment seeds.
-# These 10 are RESERVED for grading/eval -- never use them to generate
-# training demonstrations, or "robustness" is measuring memorization of
-# these exact 10 scenes, not generalization to unseen ones.
 seeds: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9]
+seeds_full_drawer: [10000, 10025, 10050, 10075, 10100]
 
-# Training data collection draws seeds from here instead -- a disjoint range
-# so overlap with the 10 eval seeds is impossible by construction, not by
-# convention. sim/collect_demonstrations.py samples from this range; nothing
-# else should ever read from it.
 training:
   seed_range: [10000, 1000000]
 
-# ---------------------------------------------------------------------------
-# Placement: rejection-sampling parameters for collision-free spawning.
-#
-# table_half_extent_m comes straight from the MJCF:
-#   <geom name="table_top" type="box" size="0.5 0.35 0.02" .../>
-# In MJCF a box's `size` IS the half-extent (easy to misread as a full
-# dimension) -- so the table is 1.0m x 0.7m, half-extents 0.5m x 0.35m.
-# Every per-object x/y range below is derived from these two numbers minus
-# margin minus that object's own effective radius.
-# ---------------------------------------------------------------------------
 placement:
-  table_half_extent_m: [0.5, 0.35]
+  table_half_extent_m: [0.46, 0.32]
   margin_from_table_edge_m: 0.02
-  min_gap_between_objects_m: 0.02
-  max_attempts: 200
-
-  # Physics settle after placement (see randomization.py reset()/_settle).
-  # Empirically the worst observed seed needed ~450 steps to reach rest;
-  # 500 gives margin. velocity_threshold is the "good enough" cutoff that
-  # lets well-behaved seeds stop early rather than always paying the full
-  # budget.
+  min_gap_between_objects_m: 0.018
+  max_attempts: 3000
   settle_max_steps: 500
   settle_velocity_threshold: 0.01
 
-  # Cutlery-only, soft constraint (for cutlery placed ON THE TABLE -- see
-  # drawer_interior below for cutlery placed INSIDE the closed drawer
-  # instead). NOT a physical collision: the drawer body sits entirely below
-  # the tabletop surface objects rest on, so there is no real 3D overlap
-  # possible between table-top cutlery and the drawer regardless of XY
-  # position. This exists purely to keep cutlery out of the drawer's
-  # overhead opening path -- an arm reaching down to open the drawer
-  # shouldn't have to route around a randomly-placed spoon.
-  # Values match the drawer's current geometry: closed center y=0.27,
-  # half-extent-y=0.08 (see the drawer body comment in the MJCF for the
-  # full redesign rationale -- this replaces the old center=0.32/half=0.09
-  # which put the closed drawer 6cm past the table edge).
+  # Drawer sweep zone: front wall travels y=0.165 (closed) -> y=0.005
+  # (fully open). Nothing spawns in that band while the drawer is closed,
+  # or the drawer pushes it off the table when opening.
   drawer_avoidance:
-    drawer_y_center_m: 0.27
-    drawer_half_extent_y_m: 0.08
-    extra_margin_m: 0.03
+    drawer_y_center_m: 0.24
+    drawer_half_extent_y_m: 0.075
+    extra_margin_m: 0.16
 
-  # Cutlery can spawn INSIDE the closed drawer instead of on the table --
-  # this is what makes "open the drawer and retrieve the cutlery" a real,
-  # sometimes-necessary task rather than always-optional flavor text. Per
-  # seed, each cutlery piece independently has `fraction_in_drawer` chance
-  # of starting inside the drawer's cavity; the rest place on the table as
-  # usual. Interior placement uses the SAME rejection-sampling machinery
-  # (2D footprint checks) as table placement, just against cavity bounds
-  # and other in-drawer items instead of the table and its neighbors.
-  #
-  # Cavity interior (from the MJCF's drawer_floor/walls): half-extent
-  # (0.114, 0.074) at local z=-0.037 (floor) up to z=0.04 (rim), in the
-  # DRAWER's own closed-position world frame (drawer center y=0.27).
-  # yaw is constrained near +/-90deg (not the full range used on the table)
-  # because the cavity's long axis is X (0.114) vs a short Y (0.074) --
-  # cutlery has to lie roughly parallel to the drawer's width to fit with
-  # any position variety at all; sideways-across-the-narrow-dimension
-  # barely fits regardless of X position. x/y bounds below already account
-  # for this constrained yaw (a much tighter, non-conservative margin than
-  # the "any yaw" bound used for table placement would allow).
   drawer_interior:
     enabled: true
-    fraction_in_drawer: 0.4
-    # Hard cap on simultaneous in-drawer items, independent of how many the
-    # per-item Bernoulli draw would otherwise select. Not a workaround --
-    # a real geometric limit: 4 items x 12cm length need ~0.108m of
-    # Y-clearance (4*2*radius + 3*min_gap), which is the cavity's ENTIRE
-    # usable Y-range with zero slack. That's only satisfiable by a perfect
-    # even spacing, not by independent random placement + fallback search.
-    # Capping at 2 keeps placement comfortably, reliably solvable.
+    fraction_in_drawer: 1.0
+    min_items_in_drawer: 2
     max_items_in_drawer: 2
-    world_y_center_closed_m: 0.27
-    cavity_x: [-0.043, 0.043]
-    cavity_y: [-0.054, 0.054]
-    cavity_yaw: [1.4208, 1.7208]   # ~90deg +/- 0.15 rad, aligns long axis with cavity's X
-    cavity_floor_local_z: -0.028   # floor TOP surface (-0.034) + capsule radius (0.006).
-                                   # NOT the floor surface itself -- putting the capsule CENTER
-                                   # on the surface buries half of it, which produced 6mm of
-                                   # initial penetration and made cutlery sink through the floor.
+    world_y_center_closed_m: 0.24
+    # The X range for each item's CENTER is computed at runtime from the
+    # item's own flat-frame vertex extent (see _place_in_drawer and
+    # _compute_flat_orientations in randomization.py). A static cavity_x
+    # cannot work here: the cutlery meshes are NOT centered on their body
+    # origin (fork_1's collision mesh spans flat-frame x in
+    # [-0.0656, +0.1333], so its origin sits ~3cm off-center), which means
+    # the safe center-x window differs per item and cannot be guessed in
+    # advance. No `cavity_x` key is read anymore; the value is dropped.
+    # cavity_y is still read: split into N equal bands (one per item) so
+    # two ~20cm cutlery pieces go front-to-back rather than trying to
+    # share one X band and poking through the drawer side walls.
+    cavity_y: [-0.030, 0.030]
+    cavity_yaw: [-0.25, 0.25]
+    cavity_floor_local_z: -0.028
 
-# ---------------------------------------------------------------------------
-# Per-object spawn ranges. x/y bounds are pre-computed (table half-extent -
-# margin - effective radius) so every object can reach anywhere on the table
-# its own physical size allows -- not fixed zones.
-#
-# `shape` drives which collision-distance formula randomization.py uses:
-#   circle  -> plate, cup, bottle (round, footprint = radius only)
-#   capsule -> cutlery (elongated; footprint is a line segment, not a point,
-#              so `radius_m` here is the CROSS-SECTION radius (6mm), not a
-#              bounding circle -- collision-avoidance treats it as the real
-#              12cm-long shape it is, not an oversized circle, so cutlery can
-#              actually pack close together the way real utensils do).
-#
-# Note: plate/cup/bottle are circularly symmetric, so their `yaw` range is
-# cosmetically/physically a no-op -- included only so every object has the
-# same schema (useful if a future asset swap makes one of them non-round).
-# ---------------------------------------------------------------------------
 objects:
-  bowl:
-    shape: circle
-    radius_m: 0.085
-    x: [-0.395, 0.395]
-    y: [-0.245, 0.245]
-    yaw: [-0.3, 0.3]
 
   plate:
     shape: circle
-    radius_m: 0.09
-    x: [-0.39, 0.39]
-    y: [-0.24, 0.24]
+    radius_m: 0.089
+    x: [-0.32, -0.02]              # left half, reachable by left arm
+    y: [-0.21, -0.089]              # front edge, clear of drawer sweep
     yaw: [-0.3, 0.3]
 
   cup:
     shape: circle
     radius_m: 0.03
-    x: [-0.45, 0.45]
-    y: [-0.30, 0.30]
+    x: [0.02, 0.18]                # right of plate, right-arm reachable
+    y: [-0.22, -0.11]
     yaw: [-0.3, 0.3]
 
   bottle:
     shape: circle
-    radius_m: 0.025
-    x: [-0.455, 0.455]
-    y: [-0.305, 0.305]
+    radius_m: 0.035
+    x: [0.22, 0.40]                # far right
+    y: [-0.22, -0.11]
     yaw: [-0.3, 0.3]
 
+  # Cutlery: 1 spoon + 1 fork. Per the task brief ("retrieve cutlery from
+  # the drawer"), both items start inside the closed drawer via the
+  # drawer_interior block above. The x/y ranges below are only used if a
+  # seed ever falls back to placing them on the table -- normally they do
+  # not, because fraction_in_drawer forces them inside.
   spoon_1:
     shape: capsule
-    radius_m: 0.006
-    half_length_m: 0.06
-    x: [-0.414, 0.414]
-    y: [-0.264, 0.264]
-    yaw: [-0.8, 0.8]
-
-  spoon_2:
-    shape: capsule
-    radius_m: 0.006
-    half_length_m: 0.06
-    x: [-0.414, 0.414]
-    y: [-0.264, 0.264]
-    yaw: [-0.8, 0.8]
+    radius_m: 0.0108
+    half_length_m: 0.0980
+    x: [-0.331, 0.331]
+    y: [-0.191, 0.191]
+    yaw: [-0.3, 0.3]
 
   fork_1:
     shape: capsule
-    radius_m: 0.006
-    half_length_m: 0.06
-    x: [-0.414, 0.414]
-    y: [-0.264, 0.264]
-    yaw: [-0.8, 0.8]
+    radius_m: 0.0073
+    half_length_m: 0.0994
+    x: [-0.333, 0.333]
+    y: [-0.193, 0.193]
+    yaw: [-0.3, 0.3]
 
-  fork_2:
-    shape: capsule
-    radius_m: 0.006
-    half_length_m: 0.06
-    x: [-0.414, 0.414]
-    y: [-0.264, 0.264]
-    yaw: [-0.8, 0.8]
-
-# Non-spatial randomization axes -- unchanged, still global (not per-object;
-# mass/friction/shape don't need per-object ranges the way placement did).
 ranges:
-  mass_scale: [0.7, 1.3]          # multiplier on nominal object mass
-  friction_scale: [0.6, 1.4]      # multiplier on nominal sliding friction
-  shape_scale: [0.9, 1.1]         # uniform scale on manipulable geoms
+  mass_scale: [0.7, 1.3]
+  friction_scale: [0.6, 1.4]
+  shape_scale: [0.9, 1.1]
 
   lighting:
     ambient: [0.2, 0.6]
     diffuse: [0.4, 0.9]
     position_jitter_m: [-0.3, 0.3]
 
-  # Camera extrinsics jitter -- small perturbation of each camera's pose
-  # around its nominal (sim.yaml-defined) position/orientation every reset.
-  # Purpose: a vision backbone trained on one exact, pixel-perfect camera
-  # framing can learn to key off incidental static cues (e.g. "the drawer
-  # edge always falls at column 214") rather than the scene content itself.
-  # Small viewpoint jitter is standard sim-to-real practice for exactly this
-  # reason. Kept deliberately mild -- large enough to break exact-pixel
-  # memorization, small enough that a camera's field of view doesn't
-  # meaningfully change what's visible.
   camera:
     pos_jitter_m: [-0.01, 0.01]
     rot_jitter_deg: [-1.0, 1.0]
@@ -205,5 +103,4 @@ ranges:
     texture_dir: sim/assets/textures/backgrounds
     randomize_table_material: true
 
-# Applied once at episode reset, never mid-episode.
 apply_at: episode_reset

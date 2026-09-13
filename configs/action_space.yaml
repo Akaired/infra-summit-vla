@@ -1,0 +1,29 @@
+# Canonical order/units for the 12-dim action every policy must produce.
+# Numeric ctrlranges are NOT duplicated here -- they're read from the
+# compiled MJCF at runtime (model.actuator_ctrlrange), so they can never
+# drift out of sync with the scene file the way a hand-copied number would.
+#
+# policy_action_convention: policy outputs are normalized to [-1, 1] per
+# dimension. sim/env.py maps that linearly onto each actuator's real
+# ctrlrange. All 12 actuators are MuJoCo <position> actuators -- ctrl is a
+# target joint angle/opening, not torque or velocity.
+
+policy_action_convention: normalized_minus1_to_1
+
+actuators:
+  - left_shoulder_pan
+  - left_shoulder_lift
+  - left_elbow_flex
+  - left_wrist_flex
+  - left_wrist_roll
+  - left_gripper
+  - right_shoulder_pan
+  - right_shoulder_lift
+  - right_elbow_flex
+  - right_wrist_flex
+  - right_wrist_roll
+  - right_gripper
+
+units:
+  joint: radians
+  gripper: meters   # finger slide position, not a normalized open/close scalar

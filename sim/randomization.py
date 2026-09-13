@@ -70,10 +70,36 @@ class NominalState:
 # 2D collision geometry: circles and line segments, in table-local XY.
 # --------------------------------------------------------------------------- #
 def _capsule_endpoints(center_xy, yaw, half_length):
-    """World-XY endpoints of a cutlery capsule at (x, y, yaw)."""
-    direction = np.array([-math.sin(yaw), math.cos(yaw)])
+    """World-XY endpoints at (x, y, yaw). Flat orientation maps the mesh's
+    long axis to world +X at yaw=0 (see compute_flat_quat), so direction
+    rotates from there."""
+    direction = np.array([math.cos(yaw), math.sin(yaw)])
     center = np.asarray(center_xy)
     return center - half_length * direction, center + half_length * direction
+
+
+def _compute_flat_quat(verts: np.ndarray) -> np.ndarray:
+    """PCA on mesh vertices: longest axis -> world X, thinnest -> world Z.
+    Lays an elongated mesh flat regardless of the mesh's own local frame."""
+    c = verts - verts.mean(axis=0)
+    _, evecs = np.linalg.eigh(c.T @ c)  # ascending eigenvalues
+    thin, mid, long = evecs[:, 0], evecs[:, 1], evecs[:, 2]
+    R = np.column_stack([long, mid, thin]).T
+    if np.linalg.det(R) < 0:
+        R[2, :] *= -1
+    q = np.zeros(4)
+    mujoco.mju_mat2Quat(q, R.flatten())
+    return q
+
+
+def _flip_about_long_axis(q: np.ndarray) -> np.ndarray:
+    """180deg about the long axis, applied AFTER q establishes world-X
+    alignment (flip is the outer/second-applied rotation) -- not before,
+    which would flip about the mesh's raw unaligned local axis instead."""
+    flip = np.array([0.0, 1.0, 0.0, 0.0])
+    out = np.zeros(4)
+    mujoco.mju_mulQuat(out, flip, q)
+    return out
 
 
 def _point_segment_dist(p, a, b):
@@ -160,6 +186,7 @@ class DomainRandomizer:
         # episode actually need to open the drawer"), not just internal.
         self._compute_robot_equilibrium_pose()
         self._capture_nominal()
+        self._compute_flat_orientations()
 
     # ------------------------------------------------------------------ #
     def _capture_nominal(self):
@@ -464,20 +491,20 @@ class DomainRandomizer:
 
     # ------------------------------------------------------------------ #
     def _placement_radius(self, name) -> float:
-        """Radius to use for placement checks -- reads the LIVE geom_size
-        for primitive-geom objects (bottle: cylinder, cutlery: capsule),
-        which (now that _randomize_shape runs BEFORE placement, see reset())
-        already reflects this seed's actual sampled shape_scale. Exact, not
-        a worst-case guess.
-
-        For mesh-based objects (bowl/plate/cup): writing geom_size on a mesh
-        geom has NO effect on its actual collision geometry (verified
-        directly -- a 5x geom_size write left geom_rbound completely
-        unchanged, because mesh collision comes from mesh_vert, not
-        geom_size). shape_scale is therefore currently a no-op for these
-        three objects regardless of execution order; the static yaml
-        radius_m is already exact and there's nothing live to read.
+        """Radius to use for placement checks. Priority:
+        1. Measured from the actual mesh (self._mesh_radius, computed once
+           via PCA in _compute_flat_orientations) -- for cutlery. This is
+           the source of truth; a hand-measured/yaml value can silently
+           drift out of sync with the real asset (verified: the fork's
+           real PCA length is 0.198m, nearly double a stale 0.105m yaml
+           value, which caused real wall penetration in the drawer).
+        2. LIVE geom_size for primitive-geom objects (bottle: cylinder),
+           which reflects this seed's actual shape_scale.
+        3. Static yaml radius_m -- for mesh objects with no live geom_size
+           (bowl/plate/cup; shape_scale is a no-op for these, see below).
         """
+        if hasattr(self, "_mesh_radius") and name in self._mesh_radius:
+            return self._mesh_radius[name]
         cfg = self.object_cfg[name]
         bid = self.model.body(name).id
         for gid in range(self.model.ngeom):
@@ -487,7 +514,9 @@ class DomainRandomizer:
 
     def _placement_half_length(self, name) -> float:
         """Capsule half-length counterpart to _placement_radius -- same
-        live-vs-static reasoning."""
+        measured-mesh-first priority."""
+        if hasattr(self, "_mesh_half_length") and name in self._mesh_half_length:
+            return self._mesh_half_length[name]
         cfg = self.object_cfg[name]
         bid = self.model.body(name).id
         for gid in range(self.model.ngeom):
@@ -505,17 +534,69 @@ class DomainRandomizer:
         p1, p2 = _capsule_endpoints(center, yaw, half_length)
         return Footprint(shape="capsule", center=center, radius=radius, p1=p1, p2=p2)
 
+    def _robot_base_positions(self):
+        """XY positions of every robot base in the model, found by name
+        pattern ('*_base' bodies that are actual robot mounts, identified
+        via the left/right arm prefixes already used elsewhere) -- not
+        hardcoded coordinates, so this stays correct through any future
+        base repositioning without a code change."""
+        positions = []
+        for bid in range(self.model.nbody):
+            name = mujoco.mj_id2name(self.model, mujoco.mjtObj.mjOBJ_BODY, bid) or ""
+            if name.endswith("_base") and (name.startswith("left_") or name.startswith("right_")):
+                positions.append(self.model.body_pos[bid][:2].copy())
+        return positions
+
+    def _violates_base_keepout(self, footprint: Footprint) -> bool:
+        """True if this footprint's circle (or capsule) comes within the
+        robot base's real physical footprint of any arm base.
+
+        This is NOT the same thing check as _collides_with_environment --
+        that only catches literal mesh overlap after the fact (mj_forward +
+        contact check); this is a proactive, cheap 2D distance check used
+        during the SAME rejection-sampling loop as the object-object gap
+        check, so a bad candidate is rejected before ever calling
+        mj_forward. Found necessary the hard way: a plate placed 7cm from a
+        base center, with its own 8.9cm radius, visually oversat the base
+        (verified: plate's own edge extended 1.9cm past the base's center
+        point) without the existing collision check ever flagging it --
+        real mesh geometry doesn't fill its own bounding sphere, so
+        "no literal mesh contact" and "doesn't visually sit on the base"
+        are different claims. This checks the second one directly.
+
+        Base footprint radius (0.1075m) measured from the actual base
+        geom's bounding sphere, not guessed -- see conversation record.
+        """
+        BASE_FOOTPRINT_RADIUS = 0.1075
+        margin = self.placement_cfg["min_gap_between_objects_m"]
+        for base_xy in self._robot_base_positions():
+            if footprint.shape == "circle":
+                dist = float(np.linalg.norm(footprint.center - base_xy))
+            else:
+                dist = _point_segment_dist(base_xy, footprint.p1, footprint.p2)
+            if dist - footprint.radius - BASE_FOOTPRINT_RADIUS < margin:
+                return True
+        return False
+
     def _violates_drawer_avoidance(self, name, footprint: Footprint) -> bool:
-        cfg = self.object_cfg[name]
-        if cfg["shape"] != "capsule":
-            return False  # soft rule applies to cutlery only, per config docstring
+        """Applies to EVERY object shape, not just cutlery. This rule used
+        to be capsule-only because the drawer sat recessed under the
+        tabletop -- no table-surface object, of any shape, could physically
+        be in its sweep path. That's no longer true: the drawer now sits ON
+        the table surface (verified the hard way -- 26/50 randomized seeds
+        had the drawer blocked from opening, and checking found bowl/plate/
+        cup/bottle sitting in the sweep path, since only capsules were ever
+        checked here)."""
         da = self.placement_cfg.get("drawer_avoidance")
         if not da:
             return False
         drawer_y_min = da["drawer_y_center_m"] - da["drawer_half_extent_y_m"] - da["extra_margin_m"]
-        # Check the capsule's endpoints, not just its center -- a segment can
-        # poke into the exclusion zone even if its center doesn't.
-        return footprint.p1[1] > drawer_y_min or footprint.p2[1] > drawer_y_min
+        if footprint.shape == "capsule":
+            # Check the capsule's endpoints, not just its center -- a
+            # segment can poke into the exclusion zone even if its center
+            # doesn't.
+            return footprint.p1[1] > drawer_y_min or footprint.p2[1] > drawer_y_min
+        return footprint.center[1] + footprint.radius > drawer_y_min
 
     def _collides_with_environment(self, data, candidate_body_id) -> bool:
         """True if the candidate object (already written into data, with
@@ -562,80 +643,290 @@ class DomainRandomizer:
     def _cutlery_names(self):
         return [n for n in self.object_names if self.object_cfg[n]["shape"] == "capsule"]
 
+    def _mesh_verts_for_body(self, name, collision_only=True):
+        bid = self.model.body(name).id
+        verts = []
+        for gid in range(self.model.ngeom):
+            if self.model.geom_bodyid[gid] != bid or self.model.geom_type[gid] != mujoco.mjtGeom.mjGEOM_MESH:
+                continue
+            if collision_only and self.model.geom_contype[gid] == 0:
+                continue  # skip visual-only geoms -- they never generate contact,
+                          # so including them overstates the collision-relevant extent
+            mid = self.model.geom_dataid[gid]
+            v = self.model.mesh_vert[self.model.mesh_vertadr[mid]:
+                                      self.model.mesh_vertadr[mid] + self.model.mesh_vertnum[mid]]
+            gpos = self.model.geom_pos[gid]
+            gquat = self.model.geom_quat[gid]
+            rot = np.zeros(9)
+            mujoco.mju_quat2Mat(rot, gquat)
+            v_in_body = (rot.reshape(3, 3) @ v.T).T + gpos
+            verts.append(v_in_body)
+        return np.concatenate(verts, axis=0)
+
+    def _settle_upright_z(self, name, quat, steps=1500):
+        """Drop `name` alone at a safe spot with the given base quat, return
+        |z-component of its long axis| after settling. Lower = flatter."""
+        data = mujoco.MjData(self.model)
+        bid = self.model.body(name).id
+        jnt_adr = self.model.body_jntadr[bid]
+        qpos_adr = self.model.jnt_qposadr[jnt_adr]
+        for other in self.object_names:
+            if other == name:
+                continue
+            oadr = self.model.jnt_qposadr[self.model.body_jntadr[self.model.body(other).id]]
+            data.qpos[oadr:oadr + 3] = [100.0, 100.0, 100.0]
+        data.qpos[qpos_adr:qpos_adr + 3] = [0.0, -0.28, 0.85]
+        data.qpos[qpos_adr + 3:qpos_adr + 7] = quat
+        mujoco.mj_forward(self.model, data)
+        for _ in range(steps):
+            mujoco.mj_step(self.model, data)
+        rot = np.zeros(9)
+        mujoco.mju_quat2Mat(rot, data.qpos[qpos_adr + 3:qpos_adr + 7])
+        long_axis_world = rot.reshape(3, 3) @ np.array([1.0, 0.0, 0.0])
+        return abs(long_axis_world[2])
+
+    def _compute_flat_orientations(self):
+        """For each cutlery item, choose the flat orientation (via the
+        settle test) and record, in that flat frame:
+          - _mesh_half_length / _mesh_radius (used by table-placement
+            footprint checks, unchanged),
+          - _flat_extent = (x_min, x_max, y_min, y_max): the actual vertex
+            bounding box in the flat frame, expressed relative to the body
+            ORIGIN -- NOT re-centered. This is the authoritative source for
+            drawer-interior x-range computation, because cutlery collision
+            meshes are not origin-centered (verified: fork_1 spans flat
+            x in [-0.0656, +0.1333], so its origin sits ~3.4cm off-center).
+            A centered half_length alone cannot describe how much the mesh
+            sticks out past the body origin, and placement based on it puts
+            the +x endpoint through the drawer wall.
+        """
+        self._flat_quat = {}
+        self._mesh_half_length = {}
+        self._mesh_radius = {}
+        self._long_eigvec = {}
+        self._flat_extent = {}
+        for name in self._cutlery_names():
+            verts = self._mesh_verts_for_body(name)
+            c = verts - verts.mean(axis=0)
+            _, evecs = np.linalg.eigh(c.T @ c)
+            thin, mid, long = evecs[:, 0], evecs[:, 1], evecs[:, 2]
+            long_proj = c @ long
+            thin_proj = c @ thin
+            self._mesh_half_length[name] = float((long_proj.max() - long_proj.min()) / 2)
+            self._mesh_radius[name] = float((thin_proj.max() - thin_proj.min()) / 2)
+            self._long_eigvec[name] = long
+
+            base = _compute_flat_quat(verts)
+            flipped = _flip_about_long_axis(base)
+            z_base = self._settle_upright_z(name, base)
+            z_flip = self._settle_upright_z(name, flipped)
+            chosen = base if z_base <= z_flip else flipped
+            self._flat_quat[name] = chosen
+            rot = np.zeros(9)
+            mujoco.mju_quat2Mat(rot, chosen)
+            R = rot.reshape(3, 3)
+            self.nominal.up_axis_world[name] = R @ np.array([0.0, 0.0, 1.0])
+
+            # Express vertices in the flat frame, keeping body-origin
+            # reference (no re-centering): this is what placement needs to
+            # know about how far the mesh extends from the origin in each
+            # direction along the flat X axis.
+            verts_flat = verts @ R.T
+            self._flat_extent[name] = (
+                float(verts_flat[:, 0].min()),
+                float(verts_flat[:, 0].max()),
+                float(verts_flat[:, 1].min()),
+                float(verts_flat[:, 1].max()),
+            )
+
+    def true_capsule_endpoints(self, data, name):
+        """Authoritative world-space endpoints of a cutlery item, computed
+        from its ACTUAL current qpos quaternion and the real PCA long axis
+        -- not by extracting an abstract 'yaw' and recomposing (that broke:
+        the object's true reference orientation is the PCA flat quat, not
+        identity, so a generic quaternion-to-yaw formula doesn't recover
+        anything meaningful). Single source of truth, used internally and
+        by tests, so the two can never silently disagree again."""
+        bid = self.model.body(name).id
+        qadr = self.model.jnt_qposadr[self.model.body_jntadr[bid]]
+        pos = data.qpos[qadr:qadr + 3]
+        quat = data.qpos[qadr + 3:qadr + 7]
+        rot = np.zeros(9)
+        mujoco.mju_quat2Mat(rot, quat)
+        world_long = rot.reshape(3, 3) @ self._long_eigvec[name]
+        half_length = self._mesh_half_length[name]
+        p1 = np.array(pos[:2]) - half_length * world_long[:2]
+        p2 = np.array(pos[:2]) + half_length * world_long[:2]
+        return p1, p2
+
     def _decide_drawer_interior(self, rng):
         """Per seed, decide which cutlery items start inside the closed
-        drawer instead of on the table. Returns a set of names. Drawn from
-        the SAME seeded rng as everything else -- consumes one rng.uniform
-        per cutlery piece (fixed draw count/order regardless of the cap
-        below, so adding/lowering max_items_in_drawer later doesn't change
-        which seeds pick which items, only how many of those picks get
-        used), deterministic and reproducible like every other
-        randomization axis here.
+        drawer instead of on the table. Returns a set of names.
 
-        Applies max_items_in_drawer as a hard cap -- see randomization.yaml
-        drawer_interior comment for why (real geometric packing limit, not
-        an arbitrary choice)."""
+        Draws exactly one rng.uniform per cutlery piece (fixed order), so
+        changing min_items_in_drawer later does NOT shift the rng stream
+        for other randomization axes (lighting, camera, background) on
+        already-used seeds -- only the drawer contents for that seed can
+        change, and only upward (never empties a previously non-empty draw).
+
+        After the random draw, enforces:
+          - min_items_in_drawer: if fewer than this many were picked by
+            chance, force-fill from the LOWEST uniform draws (they were
+            closest to being picked anyway, so it still reads as seeded).
+          - max_items_in_drawer: hard cap (real geometric packing limit).
+
+        Why min_items_in_drawer exists: with fraction_in_drawer=0.4 and 4
+        cutlery items, the probability all four land on the table is
+        0.6^4 = 13%. Those seeds are unusable for the retrieve task (the
+        drawer opens to an empty cavity, no retrieve waypoints exist, and
+        the whole bimanual phase is skipped). Seed 10001 was one of them.
+        Setting min_items_in_drawer=1 eliminates the dead-seed class
+        entirely, at the cost of biasing the distribution slightly toward
+        one-in-drawer -- which is fine, because the task is not "measure
+        the frequency of empty drawers", it is "always exercise retrieve".
+        """
         di_cfg = self.placement_cfg.get("drawer_interior")
         if not di_cfg or not di_cfg.get("enabled", False):
             return set()
+
         fraction = di_cfg["fraction_in_drawer"]
+        min_items = di_cfg.get("min_items_in_drawer", 0)
         cap = di_cfg.get("max_items_in_drawer", len(self._cutlery_names()))
-        selected = [name for name in self._cutlery_names() if rng.uniform() < fraction]
+
+        names = self._cutlery_names()
+        scores = [(name, rng.uniform()) for name in names]
+        selected = [name for name, u in scores if u < fraction]
+
+        # Force-fill if the random draw came up short.
+        if len(selected) < min_items and names:
+            remaining = sorted(
+                ((name, u) for name, u in scores if name not in selected),
+                key=lambda t: t[1],
+            )
+            for name, _ in remaining[: min_items - len(selected)]:
+                selected.append(name)
+
         return set(selected[:cap])
 
     def _place_in_drawer(self, data, rng, names, max_attempts):
-        """Rejection-sample cutlery positions inside the closed drawer's
-        cavity, checking only against other in-drawer items (the drawer is
-        closed and isolated from the table/robot at spawn time, so no
-        table-neighbor or robot-collision check applies here -- those only
-        matter for what's reachable right now, and a closed drawer's
-        contents aren't). Position is computed in the drawer's CLOSED
-        world-frame position; since these items are ordinary free-jointed
-        bodies (not parented to the drawer), when the drawer later slides
-        open, normal contact friction carries them along with its floor --
-        no special "attached to drawer" logic needed or wanted."""
+        """Place each cutlery item inside the closed drawer.
+
+        Two structural choices, both driven by what the ACTUAL mesh geometry
+        supports (measured, not assumed):
+
+        1. Y-BANDING, not x-banding. Cutlery capsules lie flat along X
+           with their full length, ~20cm end-to-end. Two of them cannot
+           share an X band in a drawer whose inner X extent is only 22cm
+           wide: each item's endpoints would poke through the side walls
+           at x = +/- 0.110, every candidate would fail the wall check,
+           and the grid-fallback would warn "no valid slot left".
+           Y-banding puts them front-to-back, each with the full X extent
+           available.
+
+        2. COMPUTED X CENTER RANGE, not a config value. The cutlery
+           collision meshes are NOT centered on their body origin --
+           fork_1's flat-frame x extent is [-0.0656, +0.1333], so at body
+           origin x=0 its +x end sits at +0.1333 and immediately contacts
+           the right wall (inner face at +0.110). A static `cavity_x` in
+           yaml cannot express that: the safe center range differs per
+           item, and for fork_1 at origin it is [-0.0424, -0.0253]. So the
+           safe range is computed at placement time from the item's own
+           measured flat extents, with a small yaw-tilt buffer, and every
+           sample is guaranteed inside it.
+        """
         di_cfg = self.placement_cfg["drawer_interior"]
         drawer_y = di_cfg["world_y_center_closed_m"]
-        x_lo, x_hi = di_cfg["cavity_x"]
-        y_lo, y_hi = di_cfg["cavity_y"]
         yaw_lo, yaw_hi = di_cfg["cavity_yaw"]
         local_z = di_cfg["cavity_floor_local_z"]
         world_z = self.model.body("drawer").pos[2] + local_z
-        min_gap = self.placement_cfg["min_gap_between_objects_m"]
-        # Tighter space than the open table -- items are long (12cm) relative
-        # to the cavity, so give rejection sampling more room to find a fit
-        # before falling back.
         drawer_max_attempts = max(max_attempts, 500)
 
-        placed_in_drawer: list[Footprint] = []
-        for name in names:
+        y_lo, y_hi = di_cfg["cavity_y"]
+
+        wall_names = ["drawer_wall_left", "drawer_wall_right",
+                      "drawer_wall_back", "drawer_wall_front"]
+        wall_geoms = {self.model.geom(n).id for n in wall_names}
+
+        # Inner side-wall faces are at x = +/- 0.110 (drawer_wall_left /
+        # drawer_wall_right: pos x = -/+0.113, size x = 0.003). Keep a 2mm
+        # safety margin from the nominal face so a contact is never
+        # generated even under mild mesh-inflation from shape_scale (which
+        # is a no-op for meshes, but stay conservative).
+        INNER_WALL_HALF_X = 0.108
+
+        def hits_wall(body_id):
+            for c in range(data.ncon):
+                con = data.contact[c]
+                g1, g2 = con.geom1, con.geom2
+                b1, b2 = self.model.geom_bodyid[g1], self.model.geom_bodyid[g2]
+                if body_id in (b1, b2) and (g1 in wall_geoms or g2 in wall_geoms):
+                    return True
+            return False
+
+        # Y bands: one per item, split evenly across cavity_y. The order
+        # is shuffled by the same rng driving every other randomized axis
+        # (deterministic per seed, varies seed-to-seed).
+        names = list(names)
+        rng.shuffle(names)
+        n_slots = max(len(names), 1)
+        slot_edges = np.linspace(y_lo, y_hi, n_slots + 1)
+
+        for slot_idx, name in enumerate(names):
+            slot_lo = float(slot_edges[slot_idx])
+            slot_hi = float(slot_edges[slot_idx + 1])
+            bid = self.model.body(name).id
+
+            # Analytic safe X center range for this item, from its own
+            # measured flat-frame extents. yaw buffer accounts for the
+            # largest in-plane y-extent swinging into x by sin(max_yaw).
+            fx_min, fx_max, fy_min, fy_max = self._flat_extent[name]
+            max_abs_yaw = max(abs(yaw_lo), abs(yaw_hi))
+            yaw_buffer = max(abs(fy_min), abs(fy_max)) * abs(np.sin(max_abs_yaw))
+            safe_x_lo = -INNER_WALL_HALF_X - fx_min + yaw_buffer
+            safe_x_hi = INNER_WALL_HALF_X - fx_max - yaw_buffer
+
+            if safe_x_lo >= safe_x_hi:
+                # Item is physically wider than the drawer interior along
+                # x even at yaw=0 -- cannot happen for the shipped assets
+                # (verified: fork window ~1cm, spoon ~1cm), so surface it
+                # clearly if a future mesh trips it.
+                print(f"[randomization] WARNING: '{name}' flat-frame x extent "
+                      f"[{fx_min:.4f}, {fx_max:.4f}] leaves no room inside the "
+                      f"drawer; placing at the range midpoint.")
+                x_center = 0.5 * (safe_x_lo + safe_x_hi)
+                safe_x_lo = safe_x_hi = x_center
+
             accepted = None
             for _ in range(drawer_max_attempts):
-                x = rng.uniform(x_lo, x_hi)
-                y = rng.uniform(y_lo, y_hi) + drawer_y
+                x = rng.uniform(safe_x_lo, safe_x_hi)
+                y = rng.uniform(slot_lo, slot_hi) + drawer_y
                 yaw = rng.uniform(yaw_lo, yaw_hi)
                 fp = self._make_footprint(name, x, y, yaw)
-                if any(_footprint_gap(fp, other) < min_gap for other in placed_in_drawer):
+                # Object-object overlap inside the drawer is allowed: items
+                # are in disjoint Y bands, and within a band overlap does
+                # not hurt (they are not being retrieved). Only wall
+                # penetration is a real failure mode.
+                self._apply_pose(data, name, x, y, yaw)
+                self._set_object_z(data, name, world_z)
+                mujoco.mj_forward(self.model, data)
+                if hits_wall(bid):
                     continue
                 accepted = (x, y, yaw, fp)
                 break
             if accepted is None:
-                # Deterministic 2D grid search over (x, y), not just y at a
-                # fixed x=0. The first item can land at any x/yaw from the
-                # random pass, so the remaining free space for a second item
-                # isn't necessarily a clean band along y at x=0 -- it can be
-                # a diagonal sliver. A y-only search at fixed x sometimes
-                # missed exactly that sliver (found empirically: 5/1000
-                # seeds failed with gaps of 0.019-0.0200m, just under the
-                # 0.02m requirement -- a 2D search covers those cases a 1D
-                # search structurally cannot). Checks each candidate against
-                # where items ACTUALLY landed, not an assumed layout.
+                # Sampling within the analytic safe range should always
+                # succeed, so reaching here means the safe-range model is
+                # off. Fall back to a deterministic grid across the same
+                # safe range, still inside the y-band.
                 yaw_mid = (yaw_lo + yaw_hi) / 2
                 grid_accepted = None
-                for x_candidate in np.linspace(x_lo, x_hi, 15):
-                    for y_candidate in np.linspace(y_lo, y_hi, 15) + drawer_y:
+                for x_candidate in np.linspace(safe_x_lo, safe_x_hi, 15):
+                    for y_candidate in np.linspace(slot_lo, slot_hi, 15) + drawer_y:
                         fp = self._make_footprint(name, x_candidate, y_candidate, yaw_mid)
-                        if any(_footprint_gap(fp, other) < min_gap for other in placed_in_drawer):
+                        self._apply_pose(data, name, x_candidate, y_candidate, yaw_mid)
+                        self._set_object_z(data, name, world_z)
+                        mujoco.mj_forward(self.model, data)
+                        if hits_wall(bid):
                             continue
                         grid_accepted = (x_candidate, y_candidate, yaw_mid, fp)
                         break
@@ -643,22 +934,19 @@ class DomainRandomizer:
                         break
                 if grid_accepted is not None:
                     print(f"[randomization] drawer interior: '{name}' used "
-                          f"2D grid-search fallback after {drawer_max_attempts} random attempts")
+                          f"grid-search fallback after {drawer_max_attempts} "
+                          f"random attempts within its analytic safe range")
                     accepted = grid_accepted
                 else:
-                    # Cavity is genuinely full (more items than comfortably
-                    # fit) -- no valid slot exists at all even on a 225-point
-                    # grid. Loud, not silent: this means fewer items should
-                    # be sent to the drawer, not that this item's overlap
-                    # should be hidden.
                     print(f"[randomization] WARNING: drawer interior has no "
-                          f"valid slot left for '{name}' -- cavity may be "
-                          f"over-subscribed for this seed's item count")
-                    y = drawer_y
+                          f"valid slot for '{name}' even within its computed "
+                          f"safe range -- cavity may be over-subscribed")
+                    y = 0.5 * (slot_lo + slot_hi) + drawer_y
                     fp = self._make_footprint(name, 0.0, y, yaw_mid)
+                    self._apply_pose(data, name, 0.0, y, yaw_mid)
+                    self._set_object_z(data, name, world_z)
                     accepted = (0.0, y, yaw_mid, fp)
             x, y, yaw, fp = accepted
-            placed_in_drawer.append(fp)
             self._apply_pose(data, name, x, y, yaw)
             self._set_object_z(data, name, world_z)
 
@@ -683,7 +971,53 @@ class DomainRandomizer:
             r = self._placement_radius(name)
             return r + (self._placement_half_length(name) if cfg["shape"] == "capsule" else 0.0)
 
-        order = sorted(table_names, key=effective_radius, reverse=True)
+        def range_area(name):
+            cfg = self.object_cfg[name]
+            x_lo, x_hi = cfg["x"]
+            y_lo, y_hi = cfg["y"]
+            return (x_hi - x_lo) * (y_hi - y_lo)
+
+        def placement_difficulty(name):
+            """Combines both ways an object can be 'hard to place first':
+            being physically large (original heuristic), or having an
+            unusually small allowed range relative to its own size (a
+            frozen/pinned object's tiny zone gets crowded by other objects'
+            much wider ranges before its own turn). Pure size-first
+            de-prioritizes small-range objects and lets them get crowded
+            out (verified: 1/100 real failure, bottle's tiny zone invaded).
+            Pure range-first over-corrects and de-prioritizes the biggest
+            objects instead, since their ranges are naturally the largest.
+
+            Also weights in shape rigidity: a circle's footprint is
+            identical at every yaw, so it has no orientation to rotate into
+            whatever gap is left -- a capsule of similar size can angle
+            itself to fit a gap a circle of the same effective radius
+            cannot. Verified this matters: without the rigidity weight,
+            round objects (plate, both circles) were placed after all
+            four cutlery (capsules, more forgiving) and lost the placement
+            race in 3/150 seeds despite having reasonable size/range
+            scores individually."""
+            cfg = self.object_cfg[name]
+            r = effective_radius(name)
+            own_area = np.pi * r * r
+            rigidity = 3.0 if cfg["shape"] == "circle" else 1.0
+            base_difficulty = rigidity * own_area / max(range_area(name), 1e-9)
+            # An object whose OWN range is a statistical outlier -- much
+            # smaller than every other object's range (e.g. a frozen/pinned
+            # object) -- needs to go essentially first regardless of shape
+            # or size, since nothing else can be trusted not to randomly
+            # land in its narrow zone first. Verified: even after the shape
+            # and size weighting above, the frozen bottle (range_area=0.056
+            # vs 0.25-0.44 for everything else -- a clear outlier) still
+            # lost its own space in 2/300 seeds to plate placed
+            # earlier under the general formula.
+            all_range_areas = [range_area(n) for n in table_names]
+            median_range = float(np.median(all_range_areas))
+            if range_area(name) < 0.5 * median_range:
+                return base_difficulty + 1000.0
+            return base_difficulty
+
+        order = sorted(table_names, key=placement_difficulty, reverse=True)
 
         # Objects not yet processed this call still sit at whatever qpos
         # mj_resetData left them at (their raw MJCF nominal pose) -- push
@@ -719,6 +1053,8 @@ class DomainRandomizer:
 
                 if self._violates_drawer_avoidance(name, fp):
                     continue
+                if self._violates_base_keepout(fp):
+                    continue
                 if any(_footprint_gap(fp, other) < min_gap for other in placed):
                     continue
 
@@ -733,20 +1069,54 @@ class DomainRandomizer:
                 break
 
             if accepted is None:
-                # Fall back to nominal pose -- but still verify it, rather
-                # than blindly trusting it. If the robot's own default pose
-                # happens to overlap this object's nominal spawn point too,
-                # silently accepting it would produce exactly the violent
-                # spawn-collision this whole check exists to prevent.
-                fallback_count += 1
-                nominal_pos = self.nominal.body_pos[name]
-                x, y, yaw = float(nominal_pos[0]), float(nominal_pos[1]), 0.0
-                fp = self._make_footprint(name, x, y, yaw)
-                self._apply_pose(data, name, x, y, yaw)
-                mujoco.mj_forward(self.model, data)
-                if self._collides_with_environment(data, bid):
-                    unresolved_robot_collision.append(name)
-                accepted = (x, y, yaw, fp)
+                # Deterministic grid search over this object's own valid
+                # range, same proven pattern as the drawer-interior fallback
+                # (see _place_in_drawer) -- a single nominal-pose fallback
+                # can't satisfy the base keep-out constraint on a crowded
+                # table (verified: 29% overlap rate before this fix, since
+                # one fixed fallback point per object has no way to route
+                # around whatever's already placed). A search over many
+                # candidates can.
+                yaw_mid = (yaw_lo + yaw_hi) / 2
+                grid_accepted = None
+                grid_safety_buffer = 0.004  # avoids landing exactly at the
+                # min_gap threshold, where grid discretization can produce a
+                # gap a millimeter or two under the requirement even though
+                # a nearby, unsampled point would clear it comfortably.
+                for x_c in np.linspace(x_lo, x_hi, 20):
+                    for y_c in np.linspace(y_lo, y_hi, 20):
+                        fp = self._make_footprint(name, x_c, y_c, yaw_mid)
+                        if self._violates_drawer_avoidance(name, fp):
+                            continue
+                        if self._violates_base_keepout(fp):
+                            continue
+                        if any(_footprint_gap(fp, other) < min_gap + grid_safety_buffer for other in placed):
+                            continue
+                        self._apply_pose(data, name, x_c, y_c, yaw_mid)
+                        mujoco.mj_forward(self.model, data)
+                        if self._collides_with_environment(data, bid):
+                            continue
+                        grid_accepted = (x_c, y_c, yaw_mid, fp)
+                        break
+                    if grid_accepted is not None:
+                        break
+
+                if grid_accepted is not None:
+                    fallback_count += 1
+                    accepted = grid_accepted
+                else:
+                    # Even the grid search found nothing -- fall back to
+                    # nominal pose as a last resort, still verified rather
+                    # than blindly trusted.
+                    fallback_count += 1
+                    nominal_pos = self.nominal.body_pos[name]
+                    x, y, yaw = float(nominal_pos[0]), float(nominal_pos[1]), 0.0
+                    fp = self._make_footprint(name, x, y, yaw)
+                    self._apply_pose(data, name, x, y, yaw)
+                    mujoco.mj_forward(self.model, data)
+                    if self._collides_with_environment(data, bid) or self._violates_base_keepout(fp):
+                        unresolved_robot_collision.append(name)
+                    accepted = (x, y, yaw, fp)
 
             x, y, yaw, fp = accepted
             placed.append(fp)
@@ -777,14 +1147,14 @@ class DomainRandomizer:
         qpos_adr = self.model.jnt_qposadr[jnt_adr]
 
         nominal_pos = self.nominal.body_pos[name]
-        nominal_quat = self.nominal.body_quat[name]
+        base_quat = self._flat_quat[name] if name in self._flat_quat else self.nominal.body_quat[name]
 
         new_pos = np.array([x, y, nominal_pos[2]])
 
         yaw_quat = np.zeros(4)
         mujoco.mju_axisAngle2Quat(yaw_quat, np.array([0.0, 0.0, 1.0]), dyaw)
         new_quat = np.zeros(4)
-        mujoco.mju_mulQuat(new_quat, yaw_quat, nominal_quat)
+        mujoco.mju_mulQuat(new_quat, yaw_quat, base_quat)
 
         data.qpos[qpos_adr:qpos_adr + 3] = new_pos
         data.qpos[qpos_adr + 3:qpos_adr + 7] = new_quat
@@ -812,7 +1182,7 @@ class DomainRandomizer:
 
     def _randomize_shape(self, rng):
         # KNOWN LIMITATION, verified empirically: writing geom_size on a
-        # MESH geom (bowl, plate, cup) has zero effect on its actual
+        # MESH geom ( plate, cup) has zero effect on its actual
         # collision geometry -- mesh collision comes from mesh_vert, not
         # geom_size (confirmed: a 5x geom_size write left geom_rbound
         # completely unchanged). This loop still runs for those objects
