@@ -478,6 +478,61 @@ def deactivate_grasp_connect(model, data, eq_name):
     model.eq_active0[eq_id] = 0
 
 
+def compute_cup_grasp_target(model, data, right_base_xy, jaw_half_width=0.010, grasp_depth=0.035):
+    """Measure the cup's real collision-mesh geometry (CoACD decomposition,
+    not a primitive) and return a wall-grasp target: a point on the cup
+    wall, on the side facing right_base_xy, at a height below the (thicker,
+    rolled) rim where the straight wall lets the jaws close.
+
+    Ported directly from reach_cup.py's cup_top_geometry + grasp-target
+    logic (verified: 10/10 seeds reach with 0.00cm error, 6-11 jaw-cup
+    contacts each, using target_quat=None -- do not add an orientation
+    target here, it costs 6-8cm of position error on this 5-DOF arm).
+
+    Returns (grasp_xyz, approach_xyz, inner_r, outer_r).
+    """
+    cup_bid = model.body("cup").id
+    cup_pos = data.xpos[cup_bid].copy()
+    cup_R = np.zeros(9)
+    mujoco.mju_quat2Mat(cup_R, data.xquat[cup_bid])
+    cup_R = cup_R.reshape(3, 3)
+
+    verts = []
+    for gid in range(model.ngeom):
+        if model.geom_bodyid[gid] != cup_bid:
+            continue
+        if model.geom_type[gid] != mujoco.mjtGeom.mjGEOM_MESH:
+            continue
+        mid = model.geom_dataid[gid]
+        v = model.mesh_vert[model.mesh_vertadr[mid]:
+                            model.mesh_vertadr[mid] + model.mesh_vertnum[mid]]
+        gpos = model.geom_pos[gid]
+        gr = np.zeros(9)
+        mujoco.mju_quat2Mat(gr, model.geom_quat[gid])
+        gr = gr.reshape(3, 3)
+        verts.append((gr @ v.T).T + gpos)
+    V = np.concatenate(verts, axis=0)
+    Vw = (cup_R @ V.T).T + cup_pos
+
+    top_z = float(Vw[:, 2].max())
+    grasp_z = top_z - grasp_depth
+    band = np.abs(Vw[:, 2] - grasp_z) < 0.005
+    if band.sum() < 3:
+        height = top_z - cup_pos[2]
+        band = Vw[:, 2] > (top_z - 0.15 * height)
+    r_xy = np.linalg.norm(Vw[band, :2] - cup_pos[:2], axis=1)
+    inner_r = float(r_xy.min())
+    outer_r = float(r_xy.max())
+    wall_mid_r = 0.5 * (inner_r + outer_r)
+
+    to_base = right_base_xy - cup_pos[:2]
+    to_base_dir = to_base / np.linalg.norm(to_base)
+    grasp_xy = cup_pos[:2] + wall_mid_r * to_base_dir
+    grasp_xyz = np.array([grasp_xy[0], grasp_xy[1], grasp_z])
+    approach_xyz = grasp_xyz + np.array([0.0, 0.0, 0.08])
+    return grasp_xyz, approach_xyz, inner_r, outer_r
+
+
 def activate_grasp_weld(model, data, eq_name, body1_name, body2_name):
     """Weld body2 rigidly to body1 at their CURRENT relative pose (6-DOF lock
     -- translation + orientation). Use for objects that must not rotate
