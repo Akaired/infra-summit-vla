@@ -19,7 +19,9 @@ name = "infra-summit-vla"
 version = "0.1.0"
 description = "Bimanual VLA manipulation with multi-modal reasoning on dual SO-101 arms in MuJoCo, optimized with OpenVINO for Intel Core Ultra."
 requires-python = ">=3.12"
-dependencies = []
+dependencies = [
+    "imageio-ffmpeg>=0.6.0",
+]
 
 [project.optional-dependencies]
 # MuJoCo scene + domain randomization (feature/mujoco-scene)

@@ -1,0 +1,169 @@
+configs:
+  sim: configs/sim.yaml
+  randomization: configs/randomization.yaml
+
+model:
+  checkpoint: checkpoints/smolvla-dinner-table-best
+  device: cuda
+  torch_seed_offset: 0
+  n_action_steps: 50
+task:
+  instruction: >-
+    Open the drawer, close the drawer, pick up the plate, and place the
+    plate in the center of the table.
+  task_feature_key: task
+
+observation:
+  # EpisodeScene возвращает:
+  # robot_state = 12 qpos + 12 qvel.
+  # SmolVLA должна получить только первые 12 qpos.
+  state:
+    source_key: robot_state
+    feature_key: observation.state
+    start: 0
+    size: 12
+
+  images_source_key: images
+  pixel_divisor: 255.0
+  resize:
+    mode: bilinear
+    align_corners: false
+    antialias: true
+
+  cameras:
+    - source_name: overhead
+      feature_key: observation.images.overhead
+
+    - source_name: wrist_left
+      feature_key: observation.images.wrist_left
+
+    - source_name: wrist_right
+      feature_key: observation.images.wrist_right
+
+action:
+  feature_key: action
+  size: 12
+  clip_to_actuator_range: true
+
+  # Порядок обязан совпадать с dataset, checkpoint и MJCF.
+  actuator_names:
+    - left_shoulder_pan
+    - left_shoulder_lift
+    - left_elbow_flex
+    - left_wrist_flex
+    - left_wrist_roll
+    - left_gripper
+    - right_shoulder_pan
+    - right_shoulder_lift
+    - right_elbow_flex
+    - right_wrist_flex
+    - right_wrist_roll
+    - right_gripper
+
+rollout:
+  # В демонстрациях кадр записывался раз в два control-такта.
+  # Один прогноз модели поэтому удерживается два вызова scene.step().
+  action_repeat: 2
+  max_policy_steps: 600
+  stop_on_success: true
+  success_hold_policy_steps: 10
+  progress_every_policy_steps: 25
+
+evaluation:
+  seeds:
+    source_config: configs/randomization.yaml
+    source_key: seeds
+
+  events:
+    drawer_opened: drawer_opened
+    drawer_closed: drawer_closed
+    plate_lifted: plate_lifted
+    plate_placed: plate_placed
+
+  sequence:
+    - drawer_opened
+    - drawer_closed
+    - plate_lifted
+    - plate_placed
+
+  drawer:
+    joint_name: drawer_slide
+    opened_travel_fraction: 0.60
+    closed_travel_fraction: 0.15
+
+  plate:
+    body_name: plate
+    lifted_delta_z_m: 0.05
+    target_xy_m: [0.0, 0.0]
+    target_radius_m: 0.12
+    surface_z_tolerance_m: 0.035
+    resting_linear_speed_mps: 0.08
+
+# В демонстрациях предметы удерживались MuJoCo constraints.
+# Здесь воспроизводится та же механика, но активация происходит по
+# контакту/расстоянию и команде gripper, а не по номеру шага сценария.
+grasp_assist:
+  enabled: true
+  log_events: true
+
+  drawer:
+    equality_name: right_grasp_connect
+    gripper_body: right_moving_jaw_so101_v1
+    object_body: drawer
+    handle_geom: drawer_handle
+    joint_name: drawer_slide
+
+    gripper_action_index: 11
+    close_threshold: -0.05
+    open_threshold: 0.05
+
+    contact_bodies:
+      - right_gripper
+      - right_moving_jaw_so101_v1
+
+    require_closed_for_activation: true
+
+    opened_travel_fraction: 0.60
+    release_max_travel_fraction: 0.15
+    release_closed_hold_policy_steps: 10
+    release_timeout_policy_steps: 80
+    prevent_reactivation_after_completed_cycle: true
+
+  plate:
+    equality_name: left_grasp_weld
+    gripper_body: left_gripper
+    object_body: plate
+    minimum_lift_before_release_m: 0.05
+    prevent_reactivation_after_release: true
+
+    contact_bodies:
+      - left_gripper
+      - left_moving_jaw_so101_v1
+
+    gripper_site: left_gripperframe
+    gripper_action_index: 5
+
+    # Во время демонстраций использовался weld. Для rollout допускаем
+    # небольшую ошибку BC-модели при подходе к тарелке.
+    activation_mode: contact
+    activation_site: left_gripperframe
+    activation_distance_m: 0.20
+    require_closed_for_activation: false
+
+    close_threshold: -0.05
+    open_threshold: 0.05
+    release_site_z_m: 0.85
+    release_timeout_policy_steps: 40
+
+output:
+  directory: outputs/eval/smolvla-dinner-table-best
+  overwrite: true
+  episodes_filename: episodes.jsonl
+  summary_filename: summary.json
+
+  video:
+    enabled: true
+    camera: overhead
+    fps: 30
+    every_n_policy_steps: 1
+    filename_pattern: seed_{seed}.mp4

@@ -1,0 +1,44 @@
+enabled: true
+log_events: true
+
+drawer:
+  equality_name: right_grasp_connect
+  gripper_body: right_moving_jaw_so101_v1
+  object_body: drawer
+  handle_geom: drawer_handle
+  joint_name: drawer_slide
+
+  contact_bodies:
+    - right_gripper
+    - right_moving_jaw_so101_v1
+
+  gripper_action_index: 11
+  require_closed_for_activation: true
+  close_threshold: -0.05
+  open_threshold: 0.05
+
+  opened_travel_fraction: 0.60
+  release_max_travel_fraction: 0.15
+  release_closed_hold_policy_steps: 10
+  release_timeout_policy_steps: 80
+  prevent_reactivation_after_completed_cycle: true
+
+plate:
+  equality_name: left_grasp_weld
+  gripper_body: left_gripper
+  object_body: plate
+
+  contact_bodies:
+    - left_gripper
+    - left_moving_jaw_so101_v1
+
+  gripper_site: left_gripperframe
+  gripper_action_index: 5
+  require_closed_for_activation: false
+  close_threshold: -0.05
+  open_threshold: 0.05
+
+  minimum_lift_before_release_m: 0.05
+  release_site_z_m: 0.85
+  release_timeout_policy_steps: 40
+  prevent_reactivation_after_release: true

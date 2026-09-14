@@ -75,6 +75,7 @@ data/*
 *.lerobot/
 .cache/
 .huggingface/
+.data/
 
 # Demo / eval media
 *.mp4
