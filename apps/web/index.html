@@ -146,6 +146,7 @@
 <script src="https://cdn.jsdelivr.net/npm/three@0.128.0/examples/js/loaders/STLLoader.js"></script>
 <script src="https://cdn.jsdelivr.net/npm/three@0.128.0/examples/js/loaders/ColladaLoader.js"></script>
 <script src="https://cdn.jsdelivr.net/npm/urdf-loader@0.12.1/umd/URDFLoader.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/three@0.128.0/examples/js/controls/OrbitControls.js"></script>
 <script>
 // ---------------------------------------------------------------------------
 // Real SO-101 rig: the actual TheRobotStudio/SO-ARM100 URDF + STL meshes
@@ -170,11 +171,23 @@ const scene3d = new THREE.Scene();
 scene3d.background = new THREE.Color(0x05070a);
 
 const camera = new THREE.PerspectiveCamera(45, 1, 0.01, 50);
-camera.position.set(1.1, 0.9, 1.1);
-camera.lookAt(0, 0.3, 0);
+// Sim frame is z-up (table top at z=0.75); viewer is y-up (mujocoToThree
+// remaps z,y -> y,z everywhere below), so this is that same point remapped:
+// looking at the table surface from an angled, slightly-above vantage.
+camera.position.set(1.1, 1.1, 0.9);
+camera.lookAt(0, 0.75, 0);
 
 const renderer = new THREE.WebGLRenderer({ antialias: true });
 viewport.appendChild(renderer.domElement);
+
+// Drag to orbit, scroll to zoom, right-drag/two-finger to pan -- without
+// this the camera was completely fixed, which made it impossible to look
+// around the scene at all.
+const controls = new THREE.OrbitControls(camera, renderer.domElement);
+controls.target.set(0, 0.75, 0);
+controls.enableDamping = true;
+controls.dampingFactor = 0.08;
+controls.update();
 
 function resizeRenderer() {
   const w = viewport.clientWidth, h = viewport.clientHeight;
@@ -189,17 +202,67 @@ const dirLight = new THREE.DirectionalLight(0xffffff, 0.8);
 dirLight.position.set(1, 2, 1);
 scene3d.add(dirLight);
 
-// table
-const table = new THREE.Mesh(
-  new THREE.BoxGeometry(1.2, 0.05, 0.7),
-  new THREE.MeshStandardMaterial({ color: 0x2a2f3a })
-);
-table.position.set(0, 0, 0);
-scene3d.add(table);
-
 const grid = new THREE.GridHelper(2, 20, 0x2a2f3a, 0x1a1e26);
 grid.position.y = -0.001;
 scene3d.add(grid);
+
+// ---------------------------------------------------------------------------
+// Static scene (table, drawer shell, room) -- built from GET /api/info's
+// static_scene, which reads the actual compiled MJCF geoms
+// (sim/assets/dinner_table_dual_so101.xml) rather than guessing a slab.
+// Every body in static_scene becomes one THREE.Group holding one mesh per
+// MuJoCo geom, positioned/rotated exactly as MuJoCo compiled them. A body
+// with a slide/hinge joint (currently just "drawer") is kept in
+// jointedBodies so live WS "objects" position updates can move the whole
+// group, not just redraw a single primitive.
+// ---------------------------------------------------------------------------
+
+const MJ_TYPE_TO_THREE = { box: 'box', sphere: 'sphere', cylinder: 'cylinder', capsule: 'capsule', plane: 'plane' };
+const jointedBodies = {}; // body name -> THREE.Group, for bodies with a joint (e.g. drawer)
+
+function meshFromStaticGeom(g) {
+  const kind = MJ_TYPE_TO_THREE[g.type];
+  let geom;
+  const [sx, sy, sz] = g.size;
+  if (kind === 'box') geom = new THREE.BoxGeometry(sx * 2, sz * 2, sy * 2); // mj half-extents, z/y swapped for y-up
+  else if (kind === 'sphere') geom = new THREE.SphereGeometry(sx, 16, 16);
+  else if (kind === 'cylinder') geom = new THREE.CylinderGeometry(sx, sx, sy * 2, 20);
+  else if (kind === 'capsule' && THREE.CapsuleGeometry) geom = new THREE.CapsuleGeometry(sx, sy * 2, 4, 12);
+  else if (kind === 'capsule') geom = new THREE.CylinderGeometry(sx, sx, sy * 2, 12); // r128 has no CapsuleGeometry
+  else if (kind === 'plane') geom = new THREE.PlaneGeometry((sx || 4) * 2, (sy || 4) * 2);
+  else return null;
+
+  const [r, gc, b, a] = g.rgba && g.rgba.length === 4 ? g.rgba : [0.6, 0.6, 0.6, 1];
+  const mesh = new THREE.Mesh(geom, new THREE.MeshStandardMaterial({
+    color: new THREE.Color(r, gc, b), transparent: a < 1, opacity: a, roughness: 0.8,
+  }));
+  mesh.position.set(g.pos[0], g.pos[2], g.pos[1]);
+  const q = g.quat; // MuJoCo wxyz
+  mesh.quaternion.set(q[1], q[3], q[2], q[0]);
+  if (kind === 'plane') mesh.rotation.x = -Math.PI / 2;
+  if (kind === 'cylinder' || kind === 'capsule') mesh.rotation.x += Math.PI / 2; // mj cylinder axis is local z, three's is local y
+  return mesh;
+}
+
+function buildStaticScene(staticScene) {
+  const bodies = staticScene?.bodies || {};
+  for (const [bodyName, body] of Object.entries(bodies)) {
+    const group = new THREE.Group();
+    group.position.set(body.body_pos[0], body.body_pos[2], body.body_pos[1]);
+    for (const g of body.geoms) {
+      const mesh = meshFromStaticGeom(g);
+      if (mesh) group.add(mesh);
+    }
+    scene3d.add(group);
+    if (body.joint) {
+      // Store the body's own base offset once; live position updates below
+      // (from WS "objects", which already includes "drawer") replace this
+      // group's position outright each tick with the current sim-frame
+      // world position, so no separate joint-value math is needed here.
+      jointedBodies[bodyName] = group;
+    }
+  }
+}
 
 const objectMeshes = {};
 const OBJECT_COLORS = {
@@ -296,6 +359,7 @@ function applyRobotState(robotState) {
 
 function animate() {
   requestAnimationFrame(animate);
+  controls.update(); // required each frame for damping to take effect
   renderer.render(scene3d, camera);
 }
 resizeRenderer();
@@ -354,9 +418,12 @@ function applyState(msg) {
 
   if (msg.objects) {
     for (const [name, pos] of Object.entries(msg.objects)) {
-      const mesh = meshForObject(name);
-      // sim frame: x,y,z meters -> viewer uses y-up, sim likely z-up.
-      mesh.position.set(pos[0], pos[2], pos[1]);
+      // "drawer" is a real jointed body already drawn by buildStaticScene()
+      // (floor+walls+handle group) -- move that group's whole shell, don't
+      // draw a second generic primitive on top of it.
+      const target = jointedBodies[name] || meshForObject(name);
+      // sim frame: x,y,z meters -> viewer uses y-up, sim z-up.
+      target.position.set(pos[0], pos[2], pos[1]);
     }
   }
 
@@ -408,6 +475,8 @@ async function loadInfo() {
       opt.value = s; opt.textContent = 'seed ' + s;
       seedSelect.appendChild(opt);
     });
+
+    if (info.static_scene) buildStaticScene(info.static_scene);
 
     if (info.arm_rig) {
       // Positions the two real URDF arms at the sim's base offsets; the

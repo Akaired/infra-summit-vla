@@ -226,6 +226,76 @@ def describe_arm_rig(scene: EpisodeScene) -> dict[str, Any]:
     return {"bases": bases, "links": links}
 
 
+def describe_static_scene(scene: EpisodeScene) -> dict[str, Any]:
+    """Read every static (non-arm) body's own geoms once, so the frontend can
+    draw the actual table/drawer/room instead of a guessed placeholder.
+
+    Mirrors describe_arm_rig(): generic over whatever
+    sim/assets/dinner_table_dual_so101.xml defines, no body/geom name
+    hardcoded here beyond skipping the arm bodies (already covered by
+    describe_arm_rig) and mesh-typed geoms (YCB visual/collision meshes,
+    already covered by the "objects" positions the frontend gets from
+    /api/info and draws with its own primitives). Excludes collision-only
+    geoms (MuJoCo render group 3-5, invisible in MuJoCo's own viewer too).
+    """
+    import mujoco
+
+    model = scene.model
+    prefixes = (
+        scene.sim_cfg["robot"]["left_arm_prefix"],
+        scene.sim_cfg["robot"]["right_arm_prefix"],
+    )
+
+    bodies: dict[str, Any] = {}
+    for body_id in range(model.nbody):
+        body_name = mujoco.mj_id2name(model, mujoco.mjtObj.mjOBJ_BODY, body_id) or ""
+        if not body_name or body_name == "world":
+            continue
+        if any(body_name.startswith(p) for p in prefixes):
+            continue  # arm bodies: already described by describe_arm_rig()
+
+        geoms = []
+        for gid in range(model.ngeom):
+            if int(model.geom_bodyid[gid]) != body_id:
+                continue
+            if int(model.geom_group[gid]) >= 3:
+                continue  # collision-only, hidden in MuJoCo's own viewer
+            gtype = int(model.geom_type[gid])
+            type_name = mujoco.mjtGeom(gtype).name.replace("mjGEOM_", "").lower()
+            if type_name == "mesh":
+                continue  # YCB objects: frontend already draws these from "objects"
+            rgba = model.geom_rgba[gid].tolist()
+            geoms.append({
+                "type": type_name,
+                "size": model.geom_size[gid].tolist(),
+                "pos": model.geom_pos[gid].tolist(),
+                "quat": model.geom_quat[gid].tolist(),
+                "rgba": rgba,
+            })
+        if not geoms:
+            continue
+
+        # Joint info (e.g. the drawer's slide joint) lets the frontend know
+        # this body moves and how, instead of treating it as static decor.
+        joint_id = int(model.body_jntadr[body_id])
+        joint = None
+        if joint_id >= 0 and int(model.body_jntnum[body_id]) > 0:
+            joint = {
+                "name": mujoco.mj_id2name(model, mujoco.mjtObj.mjOBJ_JOINT, joint_id) or "",
+                "type": mujoco.mjtJoint(int(model.jnt_type[joint_id])).name,
+                "axis": model.jnt_axis[joint_id].tolist(),
+                "range": model.jnt_range[joint_id].tolist(),
+            }
+
+        bodies[body_name] = {
+            "body_pos": model.body_pos[body_id].tolist(),
+            "geoms": geoms,
+            "joint": joint,
+        }
+
+    return {"bodies": bodies}
+
+
 def build_app(config_path: str, policy_name: str, primary_camera_override: str | None) -> FastAPI:
     eval_cfg = load_yaml(config_path)
     sim_cfg = load_yaml(eval_cfg["configs"]["sim"])
@@ -268,6 +338,10 @@ def build_app(config_path: str, policy_name: str, primary_camera_override: str |
             # MUST match scene.robot_state()'s qpos order (actuator order),
             # which is what every "robot_state" WS message uses.
             "arm_rig": describe_arm_rig(scene),
+            # Table, drawer, room walls/floor -- everything the frontend
+            # needs to draw the actual scene instead of a single guessed
+            # slab. Static per session (read once, not per WS tick).
+            "static_scene": describe_static_scene(scene),
         }
 
     @app.websocket("/ws")

@@ -15,21 +15,33 @@ which still applies.
   (same `--policy {dummy,openvino}` switch `run_episodes.py` takes). No
   physics, policy, or scene logic is reimplemented here — this file only
   bridges that loop to a browser. Also exposes `GET /api/info`, which reads
-  the compiled MJCF once (`describe_arm_rig`) and reports the arm's real
-  kinematic chain — link offsets, joint axes/ranges, each link's own
-  capsule/box geoms — so the frontend can rebuild the *exact* rig
-  `sim/assets/dinner_table_dual_so101.xml` defines instead of guessing
-  proportions.
-- `index.html` — three.js scene, arms rendered via the **real SO-101 URDF +
-  STL meshes** (`apps/web/static/so101/`, from
+  the compiled MJCF once and reports:
+  - `arm_rig` (`describe_arm_rig`) — the arm's real kinematic chain: link
+    offsets, joint axes/ranges, each link's own capsule/box geoms.
+  - `static_scene` (`describe_static_scene`) — every other static/kinematic
+    body's own geoms (table top + legs, the drawer's floor/walls/handle,
+    room floor/walls), generic over whatever
+    `sim/assets/dinner_table_dual_so101.xml` actually defines — nothing
+    about the table or drawer's size/position is hardcoded in `server.py`
+    or `index.html`, it's all read from the compiled model. Bodies with a
+    joint (currently just `drawer`, a slide joint) are flagged so the
+    frontend knows that body moves at runtime rather than treating it as
+    fixed decor.
+- `index.html` — three.js scene. Arms are rendered via the **real SO-101
+  URDF + STL meshes** (`apps/web/static/so101/`, from
   [`TheRobotStudio/SO-ARM100`](https://github.com/TheRobotStudio/SO-ARM100),
   Apache-2.0), loaded twice at runtime with `urdf-loader` — one `URDFRobot`
-  instance per arm. Each instance is positioned at the compiled MJCF's
-  `left_arm_base` / `right_arm_base` offset (from `GET /api/info`'s
-  `arm_rig.bases`), so the real meshes sit where the sim's placeholder arms
-  sit. Table objects (plate/cup/cutlery/bottle) are simple primitives
-  positioned from the same live state; a full YCB mesh import was judged not
-  worth the time against tonight's deadline.
+  instance per arm, positioned at the compiled MJCF's `left_arm_base` /
+  `right_arm_base` offset (`arm_rig.bases`). The table, drawer shell, and
+  room are built from `static_scene` (one `THREE.Group` per MJCF body, one
+  mesh per geom inside it) instead of a single guessed slab — the drawer's
+  group is re-positioned every tick from the same live `objects.drawer`
+  value the rest of the object tracking already used, so it slides open and
+  shut for real. Table objects (plate/cup/cutlery/bottle) are simple
+  primitives positioned from the same live state; a full YCB mesh import was
+  judged not worth the time against tonight's deadline. `OrbitControls` is
+  wired to the renderer's canvas — drag to orbit, scroll to zoom, right-drag
+  to pan — the camera is no longer fixed.
 - The chat box sends whatever text you type straight through as the
   `instruction` string on every policy tick — no private command grammar,
   so what you see is exactly what the policy is actually being asked.
