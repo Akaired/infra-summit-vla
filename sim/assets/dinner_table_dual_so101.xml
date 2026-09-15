@@ -251,16 +251,41 @@
     </body>
 
     <!--
-      Cutlery must lie FLAT on the table. A capsule's long axis defaults to
-      local Z, so a small euler tilt (a few degrees) still leaves it nearly
-      vertical -- it takes a full 90 deg rotation to lie down, not a nudge.
-      Rotating -90 deg (-1.5708 rad) about X maps local Z -> global Y, so the
-      capsule's 0.06 half-length now runs along Y (flat) instead of standing
-      up through the table. z = table_top_surface (0.75 + 0.02 = 0.77) +
-      capsule radius (0.006) = 0.776, so it rests exactly on the surface
-      instead of floating above it or clipping into it.
+      Cutlery must lie FLAT on the table.
+
+      IMPORTANT: the euler below rotates the BODY, but it does NOT rotate
+      the real YCB visual/collision mesh (fork/spoon textured.obj) the way
+      it looks like it should from the axis alone -- and that mismatch was
+      a real, confirmed bug (found via the live web viewer, apps/web/,
+      Sept 2026): the original "-90 about X maps capsule local Z -> world Y"
+      euler was computed for the abstract 2D collision CAPSULE that
+      randomization.py's placement code uses (see configs/randomization.yaml
+      -- shape: capsule, radius_m/half_length_m), which is NOT the same
+      geometry as fork_visual_mesh/spoon_visual_mesh. Those meshes are
+      compiled by MuJoCo with an automatic principal-axis alignment (no
+      explicit inertial frame pinned to the geom), which bakes a nontrivial
+      geom_quat into the visual/collision mesh geoms even though they
+      declare euler="0 0 0" pos="0 0 0" in this file. That baked rotation
+      is NOT the same as "long axis = local Z" -- so the old euler, correct
+      for the collision capsule, left the real mesh standing on end.
+
+      The euler values below were solved numerically (not guessed): took
+      the REAL long axis of each mesh via PCA on its actual compiled
+      mesh_vert array, composed it with the real compiled geom_quat to get
+      the axis in body frame, then solved for the body euler that puts that
+      axis flat in world (z-component ~0), preserving each object's
+      original in-table-plane (yaw) direction as closely as possible. See
+      apps/web/server.py's /api/debug_axis (diagnostic endpoint, kept for
+      this kind of check) if this ever needs re-deriving -- e.g. if the YCB
+      mesh assets are swapped for different ones.
+
+      z = table_top_surface (0.75 + 0.02 = 0.77) + capsule radius (0.006)
+      = 0.776 is unchanged -- randomization.py's _settle() physically
+      settles every object after spawn anyway, so an approximate starting
+      height here is fine; it will drop/rise to the true contact height on
+      its own.
     -->
-    <body name="spoon_1" pos="-0.05 0.05 0.776" euler="-1.5708 0 0.05">
+    <body name="spoon_1" pos="-0.05 0.05 0.776" euler="-1.320465 0.220378 1.492541">
       <joint type = 'free' class="manip_object"/>
       <geom name="spoon_1_visual" type="mesh" mesh="spoon_visual_mesh" material="spoon_material" contype="0" conaffinity="0" group="0"/>
       <geom name="spoon_1_coll_0" type="mesh" mesh="spoon_collision_mesh_0" contype="1" conaffinity="1" group="3"/>
@@ -269,7 +294,7 @@
       <geom name="spoon_1_coll_3" type="mesh" mesh="spoon_collision_mesh_3" contype="1" conaffinity="1" group="3"/>
       <inertial pos="0 0 0" mass="0.03" diaginertia="0.001 0.001 0.001"/>
     </body>
-    <body name="spoon_2" pos="-0.02 0.05 0.776" euler="-1.5708 0 -0.05">
+    <body name="spoon_2" pos="-0.02 0.05 0.776" euler="-1.030425 -0.412464 -1.343867">
       <joint type = 'free' class="manip_object"/>
       <geom name="spoon_2_visual" type="mesh" mesh="spoon_visual_mesh" material="spoon_material" contype="0" conaffinity="0" group="0"/>
       <geom name="spoon_2_coll_0" type="mesh" mesh="spoon_collision_mesh_0" contype="1" conaffinity="1" group="3"/>
@@ -278,14 +303,14 @@
       <geom name="spoon_2_coll_3" type="mesh" mesh="spoon_collision_mesh_3" contype="1" conaffinity="1" group="3"/>
       <inertial pos="0 0 0" mass="0.03" diaginertia="0.001 0.001 0.001"/>
     </body>
-    <body name="fork_1" pos="0.02 0.05 0.776" euler="-1.5708 0 0.05">
+    <body name="fork_1" pos="0.02 0.05 0.776" euler="-1.766934 -0.182878 1.550414">
       <joint type = 'free' class="manip_object"/>
       <geom name="fork_1_visual_geom" type="mesh" mesh="fork_visual_mesh" material="fork_material" pos="-0.0 0.0 -0.0" euler="0 0 0" contype="0" conaffinity="0" group="0" />
       <geom name="fork_1_collision_geom_0" type="mesh" mesh="fork_collision_mesh_0" pos="-0.0 0.0 -0.0" euler="0 0 0" contype="1" conaffinity="1" group="3" />
       <geom name="fork_1_collision_geom_1" type="mesh" mesh="fork_collision_mesh_1" pos="-0.0 0.0 -0.0" euler="0 0 0" contype="1" conaffinity="1" group="3" />
       <inertial pos="0 0 0" euler="0 0 0" mass="0.034" diaginertia="0.001 0.001 0.001" />
     </body>
-    <body name="fork_2" pos="0.05 0.05 0.776" euler="-1.5708 0 -0.05">
+    <body name="fork_2" pos="0.05 0.05 0.776" euler="-1.666968 0.089123 -1.544597">
       <joint type = 'free' class="manip_object"/>
       <geom name="fork_2_visual_geom" type="mesh" mesh="fork_visual_mesh" material="fork_material" pos="-0.0 0.0 -0.0" euler="0 0 0" contype="0" conaffinity="0" group="0" />
       <geom name="fork_2_collision_geom_0" type="mesh" mesh="fork_collision_mesh_0" pos="-0.0 0.0 -0.0" euler="0 0 0" contype="1" conaffinity="1" group="3" />

@@ -288,8 +288,55 @@ function buildStaticScene(staticScene) {
       // group's position outright each tick with the current sim-frame
       // world position, so no separate joint-value math is needed here.
       jointedBodies[bodyName] = group;
+      if (bodyName === 'drawer') buildDrawerCabinetShell(body.body_pos);
     }
   }
+}
+
+// ---------------------------------------------------------------------------
+// Purely cosmetic cabinet shell around the drawer -- NOT part of the MJCF,
+// NOT physics, NOT collidable, never moves. The sim's own drawer body (see
+// sim/assets/dinner_table_dual_so101.xml) is only the sliding compartment
+// itself (floor + 4 walls + handle) -- the source model has no outer
+// cabinet/frame around it at all, which is a real gap in that asset (kept
+// that way there, since it doesn't affect the physics/task), not something
+// this viewer got wrong. Confirmed by reading the MJCF directly: the
+// <body name="drawer"> block has no sibling frame body anywhere in the file.
+// Rendered here as a fixed static shell sized to just contain the drawer's
+// own closed-position footprint, so it doesn't render as floating/detached
+// under the table. Positioned once from static_scene's own body_pos (never
+// hardcoded), sized from the drawer geoms' own known half-extents (also
+// read from the compiled model via describe_static_scene, not guessed).
+function buildDrawerCabinetShell(drawerBodyPosMj) {
+  const wallMat = new THREE.MeshStandardMaterial({ color: 0x5a4632, roughness: 0.85 });
+  const shell = new THREE.Group();
+  // Drawer's own geoms (from the MJCF, read via /api/info) span roughly
+  // x:[-0.12,0.12] y:[-0.08,0.085] z:[-0.037,0.04] in its local frame -- the
+  // cabinet just needs to be a hair bigger on every side except the front
+  // (+Y, where it opens) to read as "the drawer slides out of this".
+  const halfX = 0.125, halfZlocal = 0.045, frontY = 0.09, backY = -0.085;
+  const thickness = 0.008;
+  // MJCF local (x, y, z) -> three local (x, z, -y), matching mjPosToThree.
+  const toThreeLocal = (x, y, z) => new THREE.Vector3(x, z, -y);
+
+  function panel(sizeX, sizeY, sizeZ, mjX, mjY, mjZ) {
+    const mesh = new THREE.Mesh(new THREE.BoxGeometry(sizeX, sizeZ, sizeY), wallMat);
+    mesh.position.copy(toThreeLocal(mjX, mjY, mjZ));
+    shell.add(mesh);
+  }
+  // Left/right side panels (run front-to-back, at +-halfX)
+  panel(thickness, frontY - backY, halfZlocal * 2, -halfX, (frontY + backY) / 2, 0);
+  panel(thickness, frontY - backY, halfZlocal * 2, halfX, (frontY + backY) / 2, 0);
+  // Back panel (closed end, -Y)
+  panel(halfX * 2, thickness, halfZlocal * 2, 0, backY, 0);
+  // Bottom panel (slightly below the drawer's own floor so it doesn't z-fight)
+  panel(halfX * 2, frontY - backY, thickness, 0, (frontY + backY) / 2, -halfZlocal - 0.002);
+  // Top panel (so it reads as a closed cabinet from above/the side, not an
+  // open-topped tray)
+  panel(halfX * 2, frontY - backY, thickness, 0, (frontY + backY) / 2, halfZlocal + 0.002);
+
+  shell.position.copy(mjPosToThree(drawerBodyPosMj));
+  scene3d.add(shell);
 }
 
 // ---------------------------------------------------------------------------
