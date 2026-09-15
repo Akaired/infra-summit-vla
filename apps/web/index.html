@@ -314,7 +314,16 @@ function buildDrawerCabinetShell(drawerBodyPosMj) {
   // x:[-0.12,0.12] y:[-0.08,0.085] z:[-0.037,0.04] in its local frame -- the
   // cabinet just needs to be a hair bigger on every side except the front
   // (+Y, where it opens) to read as "the drawer slides out of this".
-  const halfX = 0.125, halfZlocal = 0.045, frontY = 0.09, backY = -0.085;
+  //
+  // Top panel height is NOT symmetric with the bottom -- it's pinned to the
+  // real table-top's underside (table geom: pos.z=0.75, half-height 0.02,
+  // both read from the compiled model, see server.py's describe_static_scene
+  // -- underside = 0.75-0.02 = 0.73 in mj-world), so the cabinet actually
+  // touches the table instead of leaving a gap that reads as "floating a
+  // few cm below the table" (exactly what was wrong before this fix).
+  const halfX = 0.125, bottomHalfZlocal = 0.045, frontY = 0.09, backY = -0.085;
+  const tableUndersideWorldZ = 0.73; // table_top pos.z(0.75) - half-height(0.02)
+  const topLocalZ = tableUndersideWorldZ - drawerBodyPosMj[2]; // relative to drawer body origin
   const thickness = 0.008;
   // MJCF local (x, y, z) -> three local (x, z, -y), matching mjPosToThree.
   const toThreeLocal = (x, y, z) => new THREE.Vector3(x, z, -y);
@@ -324,16 +333,17 @@ function buildDrawerCabinetShell(drawerBodyPosMj) {
     mesh.position.copy(toThreeLocal(mjX, mjY, mjZ));
     shell.add(mesh);
   }
+  const midZ = (topLocalZ - bottomHalfZlocal) / 2; // vertical center of the shell's side/back panels
+  const fullHeight = topLocalZ + bottomHalfZlocal;
   // Left/right side panels (run front-to-back, at +-halfX)
-  panel(thickness, frontY - backY, halfZlocal * 2, -halfX, (frontY + backY) / 2, 0);
-  panel(thickness, frontY - backY, halfZlocal * 2, halfX, (frontY + backY) / 2, 0);
+  panel(thickness, frontY - backY, fullHeight, -halfX, (frontY + backY) / 2, midZ);
+  panel(thickness, frontY - backY, fullHeight, halfX, (frontY + backY) / 2, midZ);
   // Back panel (closed end, -Y)
-  panel(halfX * 2, thickness, halfZlocal * 2, 0, backY, 0);
+  panel(halfX * 2, thickness, fullHeight, 0, backY, midZ);
   // Bottom panel (slightly below the drawer's own floor so it doesn't z-fight)
-  panel(halfX * 2, frontY - backY, thickness, 0, (frontY + backY) / 2, -halfZlocal - 0.002);
-  // Top panel (so it reads as a closed cabinet from above/the side, not an
-  // open-topped tray)
-  panel(halfX * 2, frontY - backY, thickness, 0, (frontY + backY) / 2, halfZlocal + 0.002);
+  panel(halfX * 2, frontY - backY, thickness, 0, (frontY + backY) / 2, -bottomHalfZlocal - 0.002);
+  // Top panel -- flush against the table's own underside, no gap.
+  panel(halfX * 2, frontY - backY, thickness, 0, (frontY + backY) / 2, topLocalZ);
 
   shell.position.copy(mjPosToThree(drawerBodyPosMj));
   scene3d.add(shell);
