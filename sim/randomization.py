@@ -52,6 +52,62 @@ import mujoco
 import yaml
 
 
+def _effective_geom_rgba(model: mujoco.MjModel, gid: int) -> list:
+    """The color a geom actually renders as, accounting for a material
+    assigned via material="..." -- raw geom_rgba alone is MuJoCo's
+    hardcoded gray default [0.5,0.5,0.5,1] whenever the <geom> has no
+    rgba="..." of its own and instead points at a <material> (true for
+    table_top: its real brown lives in mat_table/tex_table). Same
+    resolution order as apps/web/server.py's effective_geom_rgba (kept as
+    a separate copy here deliberately -- sim/ has no import dependency on
+    the web viewer app, and this is a small enough function that sharing
+    it isn't worth coupling the two):
+      1. geom_rgba, if explicitly set (not the all-gray default).
+      2. mat_rgba, if the assigned material set its own rgba.
+      3. average of the material's compiled texture pixels, if it has a
+         texture but no rgba of its own.
+      4. mat_rgba as compiled (MuJoCo's [1,1,1,1] default) otherwise.
+    """
+    geom_rgba = model.geom_rgba[gid].tolist()
+    if geom_rgba != [0.5, 0.5, 0.5, 1.0]:
+        return geom_rgba
+
+    mat_id = int(model.geom_matid[gid])
+    if mat_id < 0:
+        return geom_rgba
+
+    mat_rgba = model.mat_rgba[mat_id].tolist()
+    tex_id = -1
+    if hasattr(model, "mat_texid"):
+        raw = model.mat_texid[mat_id]
+        if hasattr(raw, "__len__"):
+            role_val = raw[int(mujoco.mjtTextureRole.mjTEXROLE_RGB)]
+            tex_id = int(role_val) if role_val is not None else -1
+        else:
+            tex_id = int(raw)
+    if mat_rgba != [1.0, 1.0, 1.0, 1.0] or tex_id < 0:
+        return mat_rgba
+
+    tex_w = int(model.tex_width[tex_id])
+    tex_h = int(model.tex_height[tex_id])
+    tex_adr = int(model.tex_adr[tex_id])
+    # Real field is tex_data (flat uint8 pixel bytes), NOT tex_rgb -- that
+    # name doesn't exist on this MuJoCo version (confirmed live: "MjModel
+    # object has no attribute tex_rgb", crashed the real server on
+    # startup). Stride is tex_nchannel per pixel (3 for RGB, 4 for RGBA,
+    # not always 3), so index by that instead of assuming 3.
+    n_channels = int(model.tex_nchannel[tex_id]) if hasattr(model, "tex_nchannel") else 3
+    n_pixels = tex_w * tex_h
+    data = model.tex_data[tex_adr : tex_adr + n_pixels * n_channels]
+    if len(data) == 0 or n_channels < 3:
+        return mat_rgba
+    # Promote before averaging: summing numpy.uint8 scalars with Python's
+    # built-in sum() overflows modulo 256 and turns valid colors near black.
+    pixels = np.asarray(data, dtype=np.float64).reshape(n_pixels, n_channels)
+    avg = (pixels[:, :3].mean(axis=0) / 255.0).tolist()
+    return avg + [mat_rgba[3]]
+
+
 @dataclass
 class NominalState:
     body_pos: dict = field(default_factory=dict)
@@ -197,7 +253,20 @@ class DomainRandomizer:
         table_bid = m.body("table").id
         for gid in range(m.ngeom):
             if m.geom_bodyid[gid] == table_bid:
-                self.nominal.geom_rgba[gid] = m.geom_rgba[gid].copy()
+                # Use the geom's REAL rendered color as the randomization
+                # baseline, not the raw geom_rgba array. table_top has no
+                # rgba="..." of its own -- it points at mat_table/tex_table
+                # -- so raw geom_rgba is MuJoCo's meaningless gray default
+                # [0.5,0.5,0.5,1], not the actual brown. Tinting that gray
+                # (as this code used to do) produced a random gray-green
+                # color that then permanently overrode the material/texture
+                # for every later render, because writing anything other
+                # than the exact default into geom_rgba makes it win over
+                # the material from then on. Resolving the effective color
+                # first means the tint is relative to what the geom
+                # actually looks like (its material/texture color for
+                # table_top, its own explicit rgba for the leg/apron geoms).
+                self.nominal.geom_rgba[gid] = np.array(_effective_geom_rgba(m, gid))
 
         for lid in range(m.nlight):
             self.nominal.light_pos[lid] = m.light_pos[lid].copy()
@@ -506,16 +575,37 @@ class DomainRandomizer:
         return Footprint(shape="capsule", center=center, radius=radius, p1=p1, p2=p2)
 
     def _violates_drawer_avoidance(self, name, footprint: Footprint) -> bool:
-        cfg = self.object_cfg[name]
-        if cfg["shape"] != "capsule":
-            return False  # soft rule applies to cutlery only, per config docstring
+        # Applies to EVERY object, not just cutlery -- Sofia's own design
+        # constraint (relayed directly): "since we open the drawer, when
+        # scene is randomized there is NOTHING in the area where drawer
+        # will be opened, otherwise it sweeps objects on the way". A
+        # plate/cup/bottle in the drawer's swept path is knocked over
+        # exactly like a spoon would be -- there is nothing cutlery-specific
+        # about a sliding drawer front colliding with whatever sits in
+        # front of it. (Previously this early-returned False for every
+        # circle-shaped object, which is the concrete bug behind the red
+        # spoon resting against the drawer box in the live viewer.)
         da = self.placement_cfg.get("drawer_avoidance")
         if not da:
             return False
-        drawer_y_min = da["drawer_y_center_m"] - da["drawer_half_extent_y_m"] - da["extra_margin_m"]
-        # Check the capsule's endpoints, not just its center -- a segment can
-        # poke into the exclusion zone even if its center doesn't.
-        return footprint.p1[1] > drawer_y_min or footprint.p2[1] > drawer_y_min
+        # The drawer moves toward -Y. Cover its complete swept path, not
+        # only its closed position: front of the fully-open drawer plus a
+        # safety margin is the nearest allowed table-object boundary.
+        drawer_y_min = (
+            da["drawer_y_center_closed_m"]
+            - da["drawer_open_travel_m"]
+            - da["drawer_half_extent_y_m"]
+            - da["extra_margin_m"]
+        )
+        if footprint.shape == "capsule":
+            # Check the capsule's endpoints, not just its center -- a
+            # segment can poke into the exclusion zone even if its center
+            # doesn't.
+            return max(footprint.p1[1], footprint.p2[1]) + footprint.radius > drawer_y_min
+        # circle: account for the object's own radius, not just its center,
+        # so a wide plate/bowl can't have its edge overlap the swept zone
+        # while its center technically clears it.
+        return footprint.center[1] + footprint.radius > drawer_y_min
 
     def _collides_with_environment(self, data, candidate_body_id) -> bool:
         """True if the candidate object (already written into data, with

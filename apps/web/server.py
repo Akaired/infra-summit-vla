@@ -29,6 +29,8 @@ import sys
 from pathlib import Path
 from typing import Any
 
+import numpy as np
+
 REPO_ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(REPO_ROOT))
 
@@ -278,6 +280,145 @@ def describe_object_meshes(scene: EpisodeScene) -> dict[str, Any]:
     return out
 
 
+def describe_primitive_objects(scene: EpisodeScene) -> dict[str, Any]:
+    """Export every tracked object (sim.yaml:objects) that has NO mesh geom
+    at all -- e.g. "bottle", built from several MuJoCo primitive geoms
+    (cylinder body/shoulder/neck/lip) on one body, not a single guessed
+    shape. describe_object_meshes() already covers the mesh case; this
+    covers the rest, the same way describe_static_scene() reads a static
+    body's geoms, except keyed by tracked object name instead of body name
+    so the frontend can join it against live "objects" WS pos+quat data.
+
+    A tracked object with ANY mesh geom is intentionally skipped here (it's
+    describe_object_meshes()'s to describe) -- this only ever returns
+    bodies where every geom is a primitive, so the frontend has exactly one
+    source of truth per object, never two competing descriptions.
+
+    "drawer" is excluded for the same reason describe_static_scene() keeps
+    it despite being a tracked object: it's jointed (slide), so the
+    frontend already draws and moves its own shell via static_scene's
+    jointedBodies path (buildStaticScene). "drawer" is also all-primitive
+    geoms (box/cylinder, no mesh), so without this exclusion it would ALSO
+    match this function's own criteria and get drawn a second,
+    independently-moving time -- which is exactly the "second detached
+    drawer floating away from the table" bug this caused.
+    """
+    import mujoco
+
+    model = scene.model
+    objects_cfg = scene.sim_cfg.get("objects", {})
+    tracked_names: set[str] = set()
+    for value in objects_cfg.values():
+        tracked_names.update(value if isinstance(value, list) else [value])
+    tracked_names.discard("drawer")
+
+    out: dict[str, Any] = {}
+    for name in tracked_names:
+        body_id = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_BODY, name)
+        if body_id < 0:
+            continue
+
+        geoms = []
+        has_mesh = False
+        for gid in range(model.ngeom):
+            if int(model.geom_bodyid[gid]) != body_id:
+                continue
+            if int(model.geom_group[gid]) >= 3:
+                continue  # collision-only, hidden in MuJoCo's own viewer too
+            gtype = int(model.geom_type[gid])
+            if gtype == int(mujoco.mjtGeom.mjGEOM_MESH):
+                has_mesh = True
+                break
+            type_name = mujoco.mjtGeom(gtype).name.replace("mjGEOM_", "").lower()
+            geoms.append({
+                "type": type_name,
+                "size": model.geom_size[gid].tolist(),
+                "pos": model.geom_pos[gid].tolist(),
+                "quat": model.geom_quat[gid].tolist(),
+                "rgba": effective_geom_rgba(model, gid),
+            })
+
+        if has_mesh or not geoms:
+            continue
+        out[name] = {"geoms": geoms}
+
+    return out
+
+
+def effective_geom_rgba(model, gid: int) -> list[float]:
+    """The color a geom actually renders as, accounting for a material
+    assigned via material="..." (geom_rgba alone is [0.5,0.5,0.5,1], MuJoCo's
+    hardcoded "no color info at all" default, whenever the XML's own <geom>
+    has no rgba="..." and instead points at a <material> -- which is exactly
+    how this MJCF's table/drawer/bottle geoms are authored, so reading
+    geom_rgba directly rendered them all mid-gray instead of their real
+    material color).
+
+    Resolution order, matching MuJoCo's own render precedence:
+      1. geom_rgba, if the XML set one directly on the <geom> (not the
+         all-gray default) -- an explicit per-geom color always wins.
+      2. mat_rgba for this geom's assigned material, if that material set
+         its own rgba="..." (e.g. mat_bottle's translucent green).
+      3. the average color of the material's texture, if it has one and set
+         no rgba of its own (e.g. mat_table's brown/tan checker) -- computed
+         from the actual compiled texture pixels (model.tex_data), not a
+         guessed color, so this works for ANY texture (builtin or file),
+         not just checker.
+      4. mat_rgba as compiled (MuJoCo's own material default, [1,1,1,1]) if
+         none of the above applied.
+    """
+    import mujoco
+
+    geom_rgba = model.geom_rgba[gid].tolist()
+    if geom_rgba != [0.5, 0.5, 0.5, 1.0]:
+        return geom_rgba
+
+    mat_id = int(model.geom_matid[gid])
+    if mat_id < 0:
+        return geom_rgba  # genuinely no color info anywhere; caller gets MuJoCo's own gray default
+
+    mat_rgba = model.mat_rgba[mat_id].tolist()
+    # mat_texid is a per-texture-role array in this MuJoCo version (raises
+    # "only length-1 arrays..." if int()'d directly, confirmed live) -- read
+    # the raw value first and only then decide whether it's array-like,
+    # rather than assuming a scalar and normalizing after the fact.
+    tex_id = -1
+    if hasattr(model, "mat_texid"):
+        raw = model.mat_texid[mat_id]
+        if hasattr(raw, "__len__"):
+            role_val = raw[int(mujoco.mjtTextureRole.mjTEXROLE_RGB)]
+            tex_id = int(role_val) if role_val is not None else -1
+        else:
+            tex_id = int(raw)
+    if mat_rgba != [1.0, 1.0, 1.0, 1.0] or tex_id < 0:
+        return mat_rgba
+
+    # Material set no rgba of its own but does have a texture: average the
+    # compiled texture's actual pixels for a representative flat color
+    # (this viewer draws flat-shaded primitives, not textured ones, for
+    # static-scene geoms -- see meshFromStaticGeom in index.html).
+    #
+    # Real field is tex_data (flat uint8 pixel bytes), NOT tex_rgb -- that
+    # name doesn't exist on the installed MuJoCo version (confirmed live:
+    # crashed the real server at startup with "MjModel object has no
+    # attribute tex_rgb"). Stride is tex_nchannel per pixel (3 for RGB, 4
+    # for RGBA -- not always 3), so index by that instead of assuming 3.
+    tex_w = int(model.tex_width[tex_id])
+    tex_h = int(model.tex_height[tex_id])
+    tex_adr = int(model.tex_adr[tex_id])
+    n_channels = int(model.tex_nchannel[tex_id]) if hasattr(model, "tex_nchannel") else 3
+    n_pixels = tex_w * tex_h
+    data = model.tex_data[tex_adr : tex_adr + n_pixels * n_channels]
+    if len(data) == 0 or n_channels < 3:
+        return mat_rgba
+    # model.tex_data is uint8. Python's built-in sum() retains uint8 scalar
+    # arithmetic and overflows modulo 256, which previously made every
+    # texture average nearly zero and rendered the table pitch black.
+    pixels = np.asarray(data, dtype=np.float64).reshape(n_pixels, n_channels)
+    avg = (pixels[:, :3].mean(axis=0) / 255.0).tolist()
+    return avg + [mat_rgba[3]]
+
+
 def describe_arm_rig(scene: EpisodeScene) -> dict[str, Any]:
     """Read the compiled MJCF's arm kinematic chain: per actuated joint, the
     body it drives, that body's offset from its parent, the joint axis/range,
@@ -302,27 +443,81 @@ def describe_arm_rig(scene: EpisodeScene) -> dict[str, Any]:
         for gid in range(model.ngeom):
             if int(model.geom_bodyid[gid]) != body_id:
                 continue
+            # Collision-only duplicate of the visual geom (MJCF authors
+            # commonly emit both a visible geom and an invisible collision
+            # copy at the same pos/quat/size) -- group >= 3 is hidden in
+            # MuJoCo's own viewer too, so skip it here for the same reason
+            # describe_static_scene() does. Without this, every arm link
+            # rendered twice (harmless overdraw, but doubles payload size).
+            if int(model.geom_group[gid]) >= 3:
+                continue
             gtype = int(model.geom_type[gid])
+            type_name = mujoco.mjtGeom(gtype).name.replace("mjGEOM_", "").lower()
             size = model.geom_size[gid].tolist()
-            geoms.append({
-                "type": mujoco.mjtGeom(gtype).name.replace("mjGEOM_", "").lower(),
+            entry: dict[str, Any] = {
+                "type": type_name,
                 "size": size,
                 "pos": model.geom_pos[gid].tolist(),
+                # Resolve the actual material assigned to this individual
+                # mesh. SO-101 mixes yellow shells with black motor/camera
+                # parts; a single color for the whole arm loses that design.
+                "rgba": effective_geom_rgba(model, gid),
                 # wxyz; MuJoCo compiles a <geom fromto=...> into an equivalent
                 # pos+quat+size, so this is populated even though the source
                 # XML used fromto, not pos/quat directly.
                 "quat": model.geom_quat[gid].tolist(),
-            })
+            }
+            # Real mesh data (vertices/faces), same convention as
+            # describe_object_meshes(): "size" alone is only the geom's
+            # bounding box, not its actual shape -- without this, any mesh
+            # link (e.g. every SO-101 arm link once real meshes replaced
+            # placeholder capsules) has no faithful geometry to draw, only a
+            # bounding-box guess, which is what produced the earlier
+            # oversized/misshapen-arm rendering (drawn by a *separate* URDF
+            # model instead of this MJCF's own compiled meshes).
+            if type_name == "mesh":
+                mesh_id = int(model.geom_dataid[gid])
+                v0, vn = int(model.mesh_vertadr[mesh_id]), int(model.mesh_vertnum[mesh_id])
+                f0, fn = int(model.mesh_faceadr[mesh_id]), int(model.mesh_facenum[mesh_id])
+                entry["vertices"] = model.mesh_vert[v0 : v0 + vn].tolist()
+                entry["faces"] = model.mesh_face[f0 : f0 + fn].tolist()
+            geoms.append(entry)
         return geoms
 
+    # The arm's root body is whichever body (a) has this arm's name prefix and
+    # (b) is a direct child of "world" -- i.e. the top of that arm's own
+    # kinematic chain, wherever the MJCF's author happened to name it
+    # (world/left_arm_base/... in one XML, world/left_base/... in another).
+    # We don't hardcode the suffix ("arm_base") since that's just one scene
+    # author's naming choice, not a contract; we DO keep emitting the
+    # "{prefix}arm_base" dict key below so index.html's bases.left_arm_base /
+    # bases.right_arm_base lookup keeps working unchanged regardless of what
+    # the underlying MJCF body is actually called.
     bases = {}
     for prefix in prefixes:
-        base_name = f"{prefix}arm_base"
-        body_id = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_BODY, base_name)
+        body_id = -1
+        for candidate_id in range(model.nbody):
+            name = mujoco.mj_id2name(model, mujoco.mjtObj.mjOBJ_BODY, candidate_id) or ""
+            if name.startswith(prefix) and int(model.body_parentid[candidate_id]) == 0:
+                body_id = candidate_id
+                break
         if body_id < 0:
             continue
-        bases[base_name] = {
+        bases[f"{prefix}arm_base"] = {
             "body_pos": model.body_pos[body_id].tolist(),
+            # wxyz, body-relative to this base's own parent (world here).
+            # Left out until now -- the arm rig was built from body_pos
+            # alone, silently dropping every base/link's own rotation
+            # relative to its parent (e.g. left_base's real
+            # quat="0.707 0 0 -0.707" in the MJCF). Position-only nesting is
+            # only correct for a chain of unrotated parent-child offsets;
+            # this rig's bodies are NOT unrotated relative to each other, so
+            # omitting this collapsed/folded the whole kinematic chain in
+            # the viewer instead of letting it extend naturally -- the
+            # concrete bug behind "braccia ancora smerdate / raggruppate
+            # vicino al cassetto" once the earlier oversized-mesh bug was
+            # already fixed.
+            "body_quat": model.body_quat[body_id].tolist(),
             "geoms": geom_descriptor(body_id),
         }
 
@@ -349,6 +544,10 @@ def describe_arm_rig(scene: EpisodeScene) -> dict[str, Any]:
             "body_name": body_name,
             "parent_body": parent_name,
             "body_pos": model.body_pos[body_id].tolist(),
+            # wxyz, body-relative to parent_body -- see the "bases" dict's
+            # own body_quat comment above for why this was missing and what
+            # it broke.
+            "body_quat": model.body_quat[body_id].tolist(),
             "geoms": geom_descriptor(body_id),
         })
 
@@ -414,13 +613,12 @@ def describe_static_scene(scene: EpisodeScene) -> dict[str, Any]:
             type_name = mujoco.mjtGeom(gtype).name.replace("mjGEOM_", "").lower()
             if type_name == "mesh":
                 continue  # YCB objects: frontend already draws these from "objects"
-            rgba = model.geom_rgba[gid].tolist()
             geoms.append({
                 "type": type_name,
                 "size": model.geom_size[gid].tolist(),
                 "pos": model.geom_pos[gid].tolist(),
                 "quat": model.geom_quat[gid].tolist(),
-                "rgba": rgba,
+                "rgba": effective_geom_rgba(model, gid),
             })
         if not geoms:
             continue
@@ -496,77 +694,108 @@ def build_app(config_path: str, policy_name: str, primary_camera_override: str |
             # that have one -- plate/cup/spoon/fork -- read from the same
             # compiled model the physics uses, not a guessed sphere/box.
             "object_meshes": describe_object_meshes(scene),
+            # Tracked objects with NO mesh geom -- e.g. "bottle", built from
+            # several MuJoCo primitives on one body -- so the frontend draws
+            # that real multi-geom shape instead of a single guessed
+            # fallback primitive. Disjoint from object_meshes' keys.
+            "object_primitives": describe_primitive_objects(scene),
         }
 
-    @app.get("/api/debug_axis")
-    async def debug_axis() -> dict:
-        """Diagnostic-only: for each tracked mesh object, compute the real
-        long axis (via PCA on mesh_vert) in the COMPILED-MESH local frame,
-        then transform it through geom_quat (compiled-mesh -> body) and the
-        live body_quat (body -> world) to see where it actually points in
-        world/mj space right now. This is ground truth independent of any
-        client-side rendering code."""
-        import numpy as np
-        meshes = describe_object_meshes(scene)
-        out = {}
-        for name in ["fork_1", "spoon_1"]:
-            if name not in meshes:
-                continue
-            verts = np.array(meshes[name]["vertices"])
-            centroid = verts.mean(axis=0)
-            centered = verts - centroid
-            # PCA: long axis = eigenvector of largest eigenvalue of covariance
-            cov = centered.T @ centered
-            eigvals, eigvecs = np.linalg.eigh(cov)
-            long_axis_mesh_local = eigvecs[:, np.argmax(eigvals)]
-
-            geom_quat = meshes[name]["geom_quat"]  # wxyz
-            def quat2mat(q):
-                w, x, y, z = q
-                return np.array([
-                    [1-2*(y*y+z*z), 2*(x*y-z*w), 2*(x*z+y*w)],
-                    [2*(x*y+z*w), 1-2*(x*x+z*z), 2*(y*z-x*w)],
-                    [2*(x*z-y*w), 2*(y*z+x*w), 1-2*(x*x+y*y)],
-                ])
-            R_geom = quat2mat(geom_quat)
-            long_axis_body = R_geom @ long_axis_mesh_local
-
-            import mujoco as _mj
-            bid = _mj.mj_name2id(scene.model, _mj.mjtObj.mjOBJ_BODY, name)
-            body_quat = scene.data.xquat[bid].tolist()  # wxyz, world
-            R_body = quat2mat(body_quat)
-            long_axis_world = (R_body @ long_axis_body).tolist()
-
-            out[name] = {
-                "centroid_mesh_local": centroid.tolist(),
-                "long_axis_mesh_local": long_axis_mesh_local.tolist(),
-                "long_axis_body_frame": long_axis_body.tolist(),
-                "long_axis_world_frame": long_axis_world,
-            }
-        return out
-
-    @app.get("/api/debug_state")
-    async def debug_state() -> dict:
-        """Diagnostic-only: current live episode.state_payload() objects
-        block (pos+quat per tracked body) -- ground truth for what the
-        WS stream is actually sending right now."""
-        payload = episode.state_payload()
-        return payload.get("objects", {})
-
-    # --- Diagnostic-only endpoints below, left in deliberately -----------
-    # Not used by index.html, not on the graded path. Kept because they were
-    # exactly what resolved the fork/spoon "standing up" investigation: they
-    # let geom_pos/geom_quat/live-orientation be read directly, without
-    # wading through the (huge) per-object vertex arrays /api/info returns.
-    # Cheap, read-only, side-effect-free -- safe to leave mounted.
     @app.get("/api/debug_geom")
-    async def debug_geom() -> dict:
+    async def debug_geom() -> dict[str, Any]:
         """Diagnostic-only: geom_pos/geom_quat for tracked mesh objects,
-        without the (huge) vertex/face arrays. Not used by index.html."""
+        without the (huge) vertex/face arrays -- for quickly inspecting the
+        real compiled values while debugging orientation issues. Not used
+        by index.html."""
         meshes = describe_object_meshes(scene)
         return {
             name: {"geom_pos": m["geom_pos"], "geom_quat": m["geom_quat"]}
             for name, m in meshes.items()
+        }
+
+    @app.get("/api/debug_static_scene")
+    async def debug_static_scene() -> dict[str, Any]:
+        """Diagnostic-only: describe_static_scene()'s output as-is (no mesh
+        geoms live here, so it's already small) -- for inspecting
+        table/drawer/room body_pos and geoms without /api/info's huge
+        arm_rig mesh payload in the way."""
+        return describe_static_scene(scene)
+
+    @app.get("/api/debug_object_primitives")
+    async def debug_object_primitives() -> dict[str, Any]:
+        """Diagnostic-only: describe_primitive_objects()'s output (e.g.
+        "bottle") on its own, same reasoning as debug_static_scene above."""
+        return describe_primitive_objects(scene)
+
+    @app.get("/api/debug_texture")
+    async def debug_texture() -> dict[str, Any]:
+        """Diagnostic-only: dump every compiled texture's id, name, size,
+        tex_adr, and first-pixel RGB, plus mat_table's resolved mat_id and
+        the tex_id effective_geom_rgba() actually picks for it -- to find
+        why the table is averaging to sage-green instead of brown."""
+        import mujoco
+
+        model = scene.model
+        textures = []
+        for i in range(model.ntex):
+            tex_w = int(model.tex_width[i])
+            tex_h = int(model.tex_height[i])
+            tex_adr = int(model.tex_adr[i])
+            n_channels = int(model.tex_nchannel[i]) if hasattr(model, "tex_nchannel") else 3
+            data = model.tex_data[tex_adr : tex_adr + tex_w * tex_h * n_channels]
+            avg = None
+            if len(data) > 0 and n_channels >= 3:
+                pixels = np.asarray(data, dtype=np.float64).reshape(
+                    tex_w * tex_h, n_channels
+                )
+                avg = (pixels[:, :3].mean(axis=0) / 255.0).tolist()
+            name = mujoco.mj_id2name(model, mujoco.mjtObj.mjOBJ_TEXTURE, i)
+            textures.append(
+                {
+                    "tex_id": i,
+                    "name": name,
+                    "width": tex_w,
+                    "height": tex_h,
+                    "tex_adr": tex_adr,
+                    "avg_rgb": avg,
+                }
+            )
+
+        mat_table_id = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_MATERIAL, "mat_table")
+        mat_info: dict[str, Any] = {"mat_id": mat_table_id}
+        if mat_table_id >= 0:
+            mat_info["mat_rgba"] = model.mat_rgba[mat_table_id].tolist()
+            raw = model.mat_texid[mat_table_id]
+            if hasattr(raw, "__len__"):
+                mat_info["mat_texid_raw"] = raw.tolist()
+                mat_info["mat_texid_rgb_role"] = int(
+                    raw[int(mujoco.mjtTextureRole.mjTEXROLE_RGB)]
+                )
+            else:
+                mat_info["mat_texid_raw"] = int(raw)
+
+        table_geom_id = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_GEOM, "table_top")
+        # Raw diagnostic: first 12 raw values of tex_table's data (no math,
+        # no division) plus dtype/shape info, to see exactly what
+        # model.tex_data actually contains before any averaging touches it.
+        raw_sample: dict[str, Any] = {}
+        if model.ntex > 0:
+            raw = model.tex_data
+            raw_sample["dtype"] = str(raw.dtype) if hasattr(raw, "dtype") else type(raw).__name__
+            raw_sample["shape"] = list(raw.shape) if hasattr(raw, "shape") else None
+            raw_sample["first_12_values"] = [int(v) if hasattr(v, "__int__") else v for v in raw[:12]]
+            raw_sample["total_len"] = len(raw)
+        return {
+            "ntex": model.ntex,
+            "textures": textures,
+            "mat_table": mat_info,
+            "raw_tex_data_sample": raw_sample,
+            "table_top_geom_matid": int(model.geom_matid[table_geom_id])
+            if table_geom_id >= 0
+            else None,
+            "table_top_effective_rgba": effective_geom_rgba(model, table_geom_id)
+            if table_geom_id >= 0
+            else None,
         }
 
     @app.websocket("/ws")

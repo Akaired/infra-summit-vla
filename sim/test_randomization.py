@@ -14,7 +14,7 @@ readable/debuggable:
                            checked using the SAME circle/segment geometry
                            randomization.py used to place them, so this is
                            a genuine correctness check, not a re-guess.
-  - drawer_clearance     : cutlery respects the soft drawer-avoidance zone.
+  - drawer_clearance     : every table object clears the full drawer sweep.
   - self_collision       : no left/right arm contact at rest.
   - cross_seed_variety   : different seeds actually produce different scenes.
 """
@@ -30,11 +30,6 @@ from randomization import (
 
 TABLE_HALF_X = 0.5
 TABLE_HALF_Y = 0.35
-DRAWER_Y_CENTER = 0.27
-DRAWER_HALF_Y = 0.08
-DRAWER_EXTRA_MARGIN = 0.03
-
-
 def get_object_qpos(model, data, name):
     bid = model.body(name).id
     jnt_adr = model.body_jntadr[bid]
@@ -207,24 +202,33 @@ def check_no_real_penetration(model, data, object_names, max_penetration_m=0.003
 
 
 def check_drawer_clearance(randomizer, model, data):
-    """TABLE-placed cutlery only -- soft workspace-clearance rule (see
-    randomization.yaml `placement.drawer_avoidance` docstring). Cutlery
-    placed INSIDE the drawer this seed is intentionally in that zone --
-    that's the whole point -- so it's excluded here and checked instead by
-    check_drawer_interior."""
-    drawer_y_min = DRAWER_Y_CENTER - DRAWER_HALF_Y - DRAWER_EXTRA_MARGIN
+    """Every TABLE-placed object must clear the drawer's full swept path.
+
+    Cutlery intentionally placed inside the drawer is excluded here and
+    checked separately by check_drawer_interior.
+    """
+    da = randomizer.placement_cfg["drawer_avoidance"]
+    drawer_y_min = (
+        da["drawer_y_center_closed_m"]
+        - da["drawer_open_travel_m"]
+        - da["drawer_half_extent_y_m"]
+        - da["extra_margin_m"]
+    )
     failures = []
     for name in randomizer.object_names:
         if name in randomizer.last_in_drawer_items:
             continue
-        if randomizer.object_cfg[name]["shape"] != "capsule":
-            continue
         fp = footprint_from_state(randomizer, model, data, name)
-        if fp.p1[1] > drawer_y_min or fp.p2[1] > drawer_y_min:
-            failures.append(f"{name}: endpoint y={max(fp.p1[1], fp.p2[1]):.4f} "
-                             f"crosses drawer clearance line y={drawer_y_min:.4f}")
+        object_y_max = (
+            max(fp.p1[1], fp.p2[1]) + fp.radius
+            if fp.shape == "capsule"
+            else fp.center[1] + fp.radius
+        )
+        if object_y_max > drawer_y_min + 1e-6:
+            failures.append(f"{name}: footprint y={object_y_max:.4f} "
+                            f"crosses drawer clearance line y={drawer_y_min:.4f}")
     ok = len(failures) == 0
-    return ok, "OK (cutlery clear of drawer zone)" if ok else "FAIL:\n    " + "\n    ".join(failures)
+    return ok, "OK (all table objects clear of drawer sweep)" if ok else "FAIL:\n    " + "\n    ".join(failures)
 
 
 def check_self_collision(model, data):

@@ -27,49 +27,28 @@ which still applies.
     joint (currently just `drawer`, a slide joint) are flagged so the
     frontend knows that body moves at runtime rather than treating it as
     fixed decor.
-- `index.html` — three.js scene. Arms are rendered via the **real SO-101
-  URDF + STL meshes** (`apps/web/static/so101/`, from
-  [`TheRobotStudio/SO-ARM100`](https://github.com/TheRobotStudio/SO-ARM100),
-  Apache-2.0), loaded twice at runtime with `urdf-loader` — one `URDFRobot`
-  instance per arm, positioned at the compiled MJCF's `left_arm_base` /
-  `right_arm_base` offset (`arm_rig.bases`). The table, drawer shell, and
-  room are built from `static_scene` (one `THREE.Group` per MJCF body, one
-  mesh per geom inside it) instead of a single guessed slab — the drawer's
-  group is re-positioned every tick from the same live `objects.drawer`
-  value the rest of the object tracking already used, so it slides open and
-  shut for real. Table objects (plate/cup/cutlery/bottle) are simple
-  primitives positioned from the same live state; a full YCB mesh import was
-  judged not worth the time against tonight's deadline. `OrbitControls` is
-  wired to the renderer's canvas — drag to orbit, scroll to zoom, right-drag
-  to pan — the camera is no longer fixed.
+- `index.html` — three.js scene built from the **same compiled MJCF** used by
+  physics. Arm links use the real SO-101 STL meshes under
+  `sim/assets/so101/`, with body-relative positions, rest quaternions, live
+  joint rotations, and each geom's resolved material color exported by
+  `server.py`. The table, drawer housing, drawer, and room come from
+  `static_scene`; plate/cup/cutlery/bowl use their compiled YCB meshes and
+  textures; the bottle uses its four real primitive geoms. The drawer group
+  is moved every tick from live physics state. `OrbitControls` supports
+  orbit, zoom, and pan.
 - The chat box sends whatever text you type straight through as the
   `instruction` string on every policy tick — no private command grammar,
   so what you see is exactly what the policy is actually being asked.
 
-## Known fact about the rig (so nobody "fixes" this by accident)
+## Rig source of truth
 
-`sim/assets/dinner_table_dual_so101.xml` is explicitly a placeholder: the
-arms are built from primitive capsules/boxes (5 revolute joints + 1 slide
-gripper per arm), not real SO-101 meshes — it's a physics stand-in, not a
-visual one. The **viewer no longer renders that placeholder geometry at
-all**: `index.html` loads the real SO-101 URDF/STL rig instead (see above).
-
-Because the URDF is a different skeleton than the MJCF placeholder (different
-joint names, slightly different proportions), the mapping from sim state to
-rendered pose is by **index, not name**: `robot_state`'s first 6 actuated
-qpos values (this arm's qpos, in actuator order) drive the URDF's own 6
-joints in its natural base-to-gripper order — `shoulder_pan, shoulder_lift,
-elbow_flex, wrist_flex, wrist_roll, gripper` — via `ARM_JOINT_ORDER` in
-`index.html`. Motion is faithful to the real policy's action sequence and
-timing; absolute pose will not match the sim's capsule geometry
-pixel-for-pixel. `describe_arm_rig()` in `server.py` is unchanged and still
-only used to place the two arm bases (`arm_rig.bases`) — its per-link
-`arm_rig.links` geometry (capsule/box sizes) is no longer consumed by the
-frontend now that meshes come from the URDF instead.
-
-If a real SO-101 MJCF ever replaces the placeholder in `sim/assets/`, this
-index-based mapping should be revisited — a name-based mapping would then be
-possible and more robust.
+`sim/assets/dinner_table_dual_so101.xml` contains the two real SO-101
+kinematic chains and references the vendored STL assets in
+`sim/assets/so101/`. The viewer does not load a second URDF or maintain a
+parallel visual skeleton. `describe_arm_rig()` reads body hierarchy, geom
+transforms, mesh data, materials, axes, ranges, and actuator indices from the
+compiled model; the frontend only performs the MuJoCo-to-three.js coordinate
+conversion and applies live joint state.
 
 ## Run it
 
