@@ -306,10 +306,24 @@ function loadArm(side, basePosMujoco) {
   const loader = new URDFLoader(manager);
   loader.packages = { '': '/static/so101/' };
   loader.load('/static/so101/so101_new_calib.urdf', (robot) => {
+    // The URDF itself is Z-up (shoulder_pan's own joint axis is "0 0 1",
+    // arm rises along the URDF's local +Z) -- urdf-loader does NOT convert
+    // this to three.js's Y-up on its own, so without correcting for it the
+    // whole robot renders lying on its side. Wrap the robot in a pivot group
+    // so world placement (position, mirroring) and the URDF's own up-axis
+    // fix are applied as separate, non-conflicting rotations instead of
+    // fighting each other through a single Euler order.
+    const pivot = new THREE.Group();
+    robot.rotation.x = -Math.PI / 2; // URDF Z-up -> three.js Y-up, robot's own local frame
+    pivot.add(robot);
+
     // mujoco z-up -> three y-up, same remap used for objects.
-    robot.position.set(basePosMujoco[0], basePosMujoco[2], basePosMujoco[1]);
-    // The right arm faces the opposite way across the table.
-    if (side === 'right') robot.rotation.y = Math.PI;
+    pivot.position.set(basePosMujoco[0], basePosMujoco[2], basePosMujoco[1]);
+    // The right arm faces the opposite way across the table (mirror around
+    // the now-vertical Y axis, applied to the pivot -- not to `robot`, so it
+    // doesn't interact with the X rotation above).
+    if (side === 'right') pivot.rotation.y = Math.PI;
+
     robot.traverse((c) => {
       if (c.isMesh) {
         c.material = new THREE.MeshStandardMaterial({
@@ -319,7 +333,7 @@ function loadArm(side, basePosMujoco) {
         });
       }
     });
-    scene3d.add(robot);
+    scene3d.add(pivot);
     urdfRobots[side] = robot;
     armsReady = true;
   });
