@@ -166,6 +166,28 @@
 // match the sim's simplified capsule geometry pixel-for-pixel.
 // ---------------------------------------------------------------------------
 
+// ---------------------------------------------------------------------------
+// MuJoCo (z-up, right-handed: x,y,z) -> three.js (y-up, right-handed) frame
+// conversion, used everywhere a position/quaternion crosses from the sim to
+// the viewer. This MUST be a real rotation (determinant +1), not a bare
+// axis swap: three=(x, z, y) swaps two axes, which has determinant -1 --
+// that's a mirror reflection, not a rotation. A mirror is harmless for
+// pure positions (translation doesn't care about handedness) but WRONG for
+// every rotated thing in this scene (mesh faces, joint orientations, box
+// rotations) -- it silently flips winding/orientation, which is exactly
+// the kind of "everything is subtly misplaced/backwards" bug a screenshot
+// review catches but the position numbers alone don't. The correct
+// conversion is a genuine -90 degree rotation about X: three=(x, z, -y).
+// ---------------------------------------------------------------------------
+function mjPosToThree(p) {
+  return new THREE.Vector3(p[0], p[2], -p[1]);
+}
+function mjQuatToThree(q) {
+  // q is MuJoCo wxyz. Conjugating by the same -90-about-X change of basis:
+  // (w, x, y, z) -> (w, x, z, -y) in three's (x,y,z,w) constructor order.
+  return new THREE.Quaternion(q[1], q[3], -q[2], q[0]);
+}
+
 const viewport = document.getElementById('viewport');
 const scene3d = new THREE.Scene();
 scene3d.background = new THREE.Color(0x05070a);
@@ -220,6 +242,13 @@ scene3d.add(grid);
 const MJ_TYPE_TO_THREE = { box: 'box', sphere: 'sphere', cylinder: 'cylinder', capsule: 'capsule', plane: 'plane' };
 const jointedBodies = {}; // body name -> THREE.Group, for bodies with a joint (e.g. drawer)
 
+// MuJoCo's own cylinder/capsule primitives have their long axis along local
+// Z; three's CylinderGeometry/CapsuleGeometry have theirs along local Y. A
+// mesh built in three's local frame needs a fixed -90-about-X correction
+// for that axis difference alone (independent of, and applied BEFORE, the
+// geom's own mjQuatToThree orientation above it).
+const CYLINDER_AXIS_FIX = new THREE.Quaternion().setFromAxisAngle(new THREE.Vector3(1, 0, 0), Math.PI / 2);
+
 function meshFromStaticGeom(g) {
   const kind = MJ_TYPE_TO_THREE[g.type];
   let geom;
@@ -236,11 +265,10 @@ function meshFromStaticGeom(g) {
   const mesh = new THREE.Mesh(geom, new THREE.MeshStandardMaterial({
     color: new THREE.Color(r, gc, b), transparent: a < 1, opacity: a, roughness: 0.8,
   }));
-  mesh.position.set(g.pos[0], g.pos[2], g.pos[1]);
-  const q = g.quat; // MuJoCo wxyz
-  mesh.quaternion.set(q[1], q[3], q[2], q[0]);
-  if (kind === 'plane') mesh.rotation.x = -Math.PI / 2;
-  if (kind === 'cylinder' || kind === 'capsule') mesh.rotation.x += Math.PI / 2; // mj cylinder axis is local z, three's is local y
+  mesh.position.copy(mjPosToThree(g.pos));
+  mesh.quaternion.copy(mjQuatToThree(g.quat));
+  if (kind === 'plane') mesh.quaternion.multiply(new THREE.Quaternion().setFromAxisAngle(new THREE.Vector3(1, 0, 0), -Math.PI / 2));
+  if (kind === 'cylinder' || kind === 'capsule') mesh.quaternion.multiply(CYLINDER_AXIS_FIX);
   return mesh;
 }
 
@@ -248,7 +276,7 @@ function buildStaticScene(staticScene) {
   const bodies = staticScene?.bodies || {};
   for (const [bodyName, body] of Object.entries(bodies)) {
     const group = new THREE.Group();
-    group.position.set(body.body_pos[0], body.body_pos[2], body.body_pos[1]);
+    group.position.copy(mjPosToThree(body.body_pos));
     for (const g of body.geoms) {
       const mesh = meshFromStaticGeom(g);
       if (mesh) group.add(mesh);
@@ -264,20 +292,124 @@ function buildStaticScene(staticScene) {
   }
 }
 
-const objectMeshes = {};
-const OBJECT_COLORS = {
-  plate: 0xe7e9ee, cup: 0x7dd3a8, mug: 0x7dd3a8, bottle: 0x4a90d9, drawer: 0x8b6a3a,
-};
+// ---------------------------------------------------------------------------
+// Table objects. Anything with a real visual mesh (GET /api/info's
+// object_meshes -- plate/cup/spoon/fork, read straight from the compiled
+// MJCF's own mesh_vert/mesh_face/mesh_texcoord arrays, see server.py's
+// describe_object_meshes()) is drawn as that actual mesh, textured from its
+// real texture_map.png when one is mapped. Anything without one (currently
+// just "bottle", a primitive MJCF cylinder with no mesh asset) falls back
+// to a simple primitive -- not a guess at what the object looks like, just
+// the true shape the sim itself uses for it.
+// ---------------------------------------------------------------------------
 
-function meshForObject(name) {
-  if (objectMeshes[name]) return objectMeshes[name];
+const objectMeshes = {}; // body name -> THREE.Object3D (mesh or primitive fallback)
+const FALLBACK_COLORS = { bottle: 0x4a90d9, drawer: 0x8b6a3a, mug: 0x7dd3a8 };
+const textureLoader = new THREE.TextureLoader();
+
+function buildObjectMesh(name, meshData) {
+  // MuJoCo's own compiled-mesh frame chain (server.py's describe_object_meshes
+  // docstring): world = body_xform * geom_xform * mesh_xform * mesh_vert.
+  // body_xform is applied at runtime (position/quaternion on the returned
+  // Object3D, updated every WS tick from live "objects" pos+quat); geom_xform
+  // and mesh_xform are both fixed for the object's lifetime, so they're baked
+  // once into the BufferGeometry here rather than kept as extra live nodes.
+  const geometry = new THREE.BufferGeometry();
+  const verts = new Float32Array(meshData.vertices.flat());
+  geometry.setAttribute('position', new THREE.BufferAttribute(verts, 3));
+  geometry.setIndex(meshData.faces.flat());
+  if (meshData.texcoords && meshData.face_texcoords) {
+    // mesh_face and mesh_facetexcoord can index vertices/uvs independently;
+    // rebuild a per-vertex UV array aligned to the position buffer by
+    // scattering each face's texcoord triplet onto that face's vertex
+    // indices (a vertex shared by faces with consistent UVs is written
+    // redundantly but consistently -- fine for a static prop mesh).
+    const uv = new Float32Array((verts.length / 3) * 2);
+    const faces = meshData.faces;
+    const faceUvs = meshData.face_texcoords;
+    const src = meshData.texcoords;
+    for (let f = 0; f < faces.length; f++) {
+      for (let k = 0; k < 3; k++) {
+        const vi = faces[f][k];
+        const ti = faceUvs[f][k];
+        uv[vi * 2] = src[ti][0];
+        uv[vi * 2 + 1] = 1 - src[ti][1]; // MuJoCo/OBJ v is bottom-up; three's is top-down
+      }
+    }
+    geometry.setAttribute('uv', new THREE.BufferAttribute(uv, 2));
+  } else if (meshData.texcoords) {
+    // No independent face-texcoord indexing available (older MuJoCo): the
+    // mesh_face indices double as texcoord indices directly.
+    const uv = new Float32Array((verts.length / 3) * 2);
+    for (let i = 0; i < meshData.texcoords.length; i++) {
+      uv[i * 2] = meshData.texcoords[i][0];
+      uv[i * 2 + 1] = 1 - meshData.texcoords[i][1];
+    }
+    geometry.setAttribute('uv', new THREE.BufferAttribute(uv, 2));
+  }
+  geometry.computeVertexNormals();
+
+  // Bake mesh_xform (mesh-local -> geom frame) then geom_xform (geom -> body
+  // frame) into the geometry itself, both still in MuJoCo's own coordinate
+  // convention -- then apply the single mj->three basis change last, via
+  // the wrapping Object3D below, exactly once.
+  const meshLocal = new THREE.Matrix4().compose(
+    new THREE.Vector3(...meshData.mesh_pos),
+    new THREE.Quaternion(meshData.mesh_quat[1], meshData.mesh_quat[2], meshData.mesh_quat[3], meshData.mesh_quat[0]),
+    new THREE.Vector3(1, 1, 1),
+  );
+  const geomLocal = new THREE.Matrix4().compose(
+    new THREE.Vector3(...meshData.geom_pos),
+    new THREE.Quaternion(meshData.geom_quat[1], meshData.geom_quat[2], meshData.geom_quat[3], meshData.geom_quat[0]),
+    new THREE.Vector3(1, 1, 1),
+  );
+  geometry.applyMatrix4(meshLocal);
+  geometry.applyMatrix4(geomLocal);
+  // Now convert every baked (still mj-frame) vertex into three's frame with
+  // the same real rotation used everywhere else (mjPosToThree), not a
+  // mirror -- done per-vertex here since it's a one-time bake, not a
+  // per-frame transform.
+  const posAttr = geometry.getAttribute('position');
+  for (let i = 0; i < posAttr.count; i++) {
+    const p = mjPosToThree([posAttr.getX(i), posAttr.getY(i), posAttr.getZ(i)]);
+    posAttr.setXYZ(i, p.x, p.y, p.z);
+  }
+  posAttr.needsUpdate = true;
+  geometry.computeVertexNormals();
+
+  const materialOpts = { color: 0xffffff, roughness: 0.75 };
+  if (meshData.texture) materialOpts.map = textureLoader.load(meshData.texture);
+  if (!meshData.texture && meshData.rgba) {
+    const [r, g, b] = meshData.rgba;
+    materialOpts.color = new THREE.Color(r, g, b);
+  }
+  const mesh = new THREE.Mesh(geometry, new THREE.MeshStandardMaterial(materialOpts));
+  scene3d.add(mesh);
+  return mesh;
+}
+
+function buildFallbackObjectMesh(name) {
   const isCutlery = /^(spoon|fork)/.test(name);
   const geom = isCutlery
     ? new THREE.BoxGeometry(0.02, 0.01, 0.12)
-    : new THREE.SphereGeometry(0.045, 16, 16);
-  const color = OBJECT_COLORS[name.replace(/_\d+$/, '')] ?? 0xaaaaaa;
+    : new THREE.CylinderGeometry(0.025, 0.025, 0.18, 16); // matches "bottle"'s own MJCF cylinder proportions
+  const color = FALLBACK_COLORS[name.replace(/_\d+$/, '')] ?? 0xaaaaaa;
   const mesh = new THREE.Mesh(geom, new THREE.MeshStandardMaterial({ color }));
   scene3d.add(mesh);
+  return mesh;
+}
+
+function buildObjectMeshes(objectMeshData) {
+  for (const [name, meshData] of Object.entries(objectMeshData || {})) {
+    objectMeshes[name] = buildObjectMesh(name, meshData);
+  }
+}
+
+function meshForObject(name) {
+  if (objectMeshes[name]) return objectMeshes[name];
+  // No real mesh available for this body (e.g. "bottle") -- fall back to a
+  // shape-matched primitive instead of leaving it invisible.
+  const mesh = buildFallbackObjectMesh(name);
   objectMeshes[name] = mesh;
   return mesh;
 }
@@ -317,8 +449,10 @@ function loadArm(side, basePosMujoco) {
     robot.rotation.x = -Math.PI / 2; // URDF Z-up -> three.js Y-up, robot's own local frame
     pivot.add(robot);
 
-    // mujoco z-up -> three y-up, same remap used for objects.
-    pivot.position.set(basePosMujoco[0], basePosMujoco[2], basePosMujoco[1]);
+    // mujoco z-up -> three y-up, same real-rotation remap used everywhere
+    // else in this file (mjPosToThree) -- NOT the old (x, z, y) axis-swap,
+    // which was a mirror reflection (determinant -1), not a rotation.
+    pivot.position.copy(mjPosToThree(basePosMujoco));
     // The right arm faces the opposite way across the table (mirror around
     // the now-vertical Y axis, applied to the pivot -- not to `robot`, so it
     // doesn't interact with the X rotation above).
@@ -431,13 +565,16 @@ function applyState(msg) {
   ovStep.textContent = msg.policy_steps ?? 0;
 
   if (msg.objects) {
-    for (const [name, pos] of Object.entries(msg.objects)) {
+    for (const [name, state] of Object.entries(msg.objects)) {
       // "drawer" is a real jointed body already drawn by buildStaticScene()
       // (floor+walls+handle group) -- move that group's whole shell, don't
       // draw a second generic primitive on top of it.
       const target = jointedBodies[name] || meshForObject(name);
-      // sim frame: x,y,z meters -> viewer uses y-up, sim z-up.
-      target.position.set(pos[0], pos[2], pos[1]);
+      target.position.copy(mjPosToThree(state.pos));
+      // Real orientation, not just position -- a plate/cup/fork left at a
+      // fixed default rotation while the physics actually tips/spins it
+      // was itself a "wrong placement" symptom, not just a cosmetic gap.
+      if (state.quat) target.quaternion.copy(mjQuatToThree(state.quat));
     }
   }
 
@@ -491,6 +628,7 @@ async function loadInfo() {
     });
 
     if (info.static_scene) buildStaticScene(info.static_scene);
+    if (info.object_meshes) buildObjectMeshes(info.object_meshes);
 
     if (info.arm_rig) {
       // Positions the two real URDF arms at the sim's base offsets; the

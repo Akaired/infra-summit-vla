@@ -136,17 +136,137 @@ class LiveEpisode:
             payload["subtasks"] = dict(self.tracker.status)
         return payload
 
-    def _object_positions(self) -> dict[str, list[float]]:
+    def _object_positions(self) -> dict[str, dict[str, list[float]]]:
+        """Per tracked object: world position AND orientation.
+
+        Position alone (the original version of this method) is enough for
+        the free-standing table objects but wrong for anything the frontend
+        renders as a real oriented mesh (plate/cup/spoon/fork) or a moving
+        rigid shell (the drawer) -- those need the body's actual world
+        quaternion too, or they render pinned to a fixed default rotation
+        while the physics spins/rotates them. data.xquat is always populated
+        by MuJoCo for every body; no name or index here is hardcoded beyond
+        the object names sim.yaml:objects already lists.
+        """
         objects_cfg = self.scene.sim_cfg.get("objects", {})
-        out: dict[str, list[float]] = {}
+        out: dict[str, dict[str, list[float]]] = {}
         for key, value in objects_cfg.items():
             names = value if isinstance(value, list) else [value]
             for name in names:
                 try:
-                    out[name] = self.scene.body_xpos(name).tolist()
+                    body_id = self.scene.model.body(name).id
+                    out[name] = {
+                        "pos": self.scene.body_xpos(name).tolist(),
+                        "quat": self.scene.data.xquat[body_id].tolist(),  # wxyz
+                    }
                 except Exception:
                     continue
         return out
+
+
+# Texture image per tracked body, for the visual mesh describe_object_meshes()
+# exports. Unlike everything else in this file, this one small map IS
+# hand-written rather than read back from the compiled model: MuJoCo's
+# compiler bakes OBJ/MTL/PNG assets into internal arrays and does not
+# preserve the original source file path anywhere on MjModel (confirmed:
+# there is no mesh_pathadr/tex_pathadr -- mj_saveXML re-emits asset *names*,
+# not source paths). The texture files themselves already live in this repo
+# at sim/assets/ycb/<dir>/texture_map.png (see the <mesh>/<material> tags in
+# sim/assets/dinner_table_dual_so101.xml); this only records which directory
+# goes with which tracked body name, copied into apps/web/static/ycb/ by
+# hand alongside this file. A body absent here (or one with no mesh geom at
+# all, like "bottle") just renders untextured/flat-shaded on the frontend.
+OBJECT_TEXTURES = {
+    "plate": "ycb/plate/texture_map.png",
+    "cup": "ycb/g_cups/texture_map.png",
+    "spoon_1": "ycb/spoon/texture_map.png",
+    "spoon_2": "ycb/spoon/texture_map.png",
+    "fork_1": "ycb/fork/texture_map.png",
+    "fork_2": "ycb/fork/texture_map.png",
+}
+
+
+def describe_object_meshes(scene: EpisodeScene) -> dict[str, Any]:
+    """Export the actual visual mesh (vertices + triangles + UVs, if any) for
+    every tracked object body that has one, read directly from the compiled
+    model -- not the source .obj files, and not a guessed primitive.
+
+    Why not just serve the .obj files under sim/assets/ycb/ directly: MuJoCo
+    re-centers/re-orients a mesh asset into its own inertial frame at compile
+    time (mesh_pos/mesh_quat), and that same compiled mesh is what the
+    physics actually simulates contact against -- reading it back from the
+    model guarantees the viewer draws exactly what the sim sees, with no
+    separate OBJ-parsing path that could drift out of sync (different vertex
+    winding, a re-exported/rescaled OBJ, etc). Only objects listed in
+    sim.yaml:objects are considered; a body with no mesh geom (e.g. "bottle",
+    a primitive cylinder) is simply absent from the result -- the frontend
+    already draws primitives for those.
+
+    Frame chain per MuJoCo's own compiled-mesh convention: world position
+    for vertex v of this geom's mesh is
+        body_xpos + body_xmat @ (geom_pos + geom_mat @ (mesh_pos + mesh_mat @ mesh_vert[v]))
+    Sending mesh_pos/mesh_quat and geom_pos/geom_quat (both already relative
+    to the body, like describe_arm_rig's link geoms) lets the frontend do
+    that same chain once at load time, then just move/rotate the body each
+    tick from the live "objects" pos+quat -- no per-vertex work at runtime.
+    """
+    import mujoco
+
+    model = scene.model
+    objects_cfg = scene.sim_cfg.get("objects", {})
+    tracked_names: set[str] = set()
+    for value in objects_cfg.values():
+        tracked_names.update(value if isinstance(value, list) else [value])
+
+    out: dict[str, Any] = {}
+    for name in tracked_names:
+        body_id = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_BODY, name)
+        if body_id < 0:
+            continue
+        mesh_geom = None
+        for gid in range(model.ngeom):
+            if int(model.geom_bodyid[gid]) != body_id:
+                continue
+            if int(model.geom_type[gid]) != mujoco.mjtGeom.mjGEOM_MESH:
+                continue
+            if int(model.geom_group[gid]) >= 3:
+                continue  # collision-only mesh; the *_visual_geom is group 0
+            mesh_geom = gid
+            break
+        if mesh_geom is None:
+            continue  # e.g. "bottle": a primitive geom, no mesh to export
+
+        mesh_id = int(model.geom_dataid[mesh_geom])
+        v0, vn = int(model.mesh_vertadr[mesh_id]), int(model.mesh_vertnum[mesh_id])
+        f0, fn = int(model.mesh_faceadr[mesh_id]), int(model.mesh_facenum[mesh_id])
+        t0 = int(model.mesh_texcoordadr[mesh_id])
+        tn = int(model.mesh_texcoordnum[mesh_id]) if t0 >= 0 else 0
+
+        entry: dict[str, Any] = {
+            "vertices": model.mesh_vert[v0 : v0 + vn].tolist(),
+            "faces": model.mesh_face[f0 : f0 + fn].tolist(),
+            "mesh_pos": model.mesh_pos[mesh_id].tolist(),
+            "mesh_quat": model.mesh_quat[mesh_id].tolist(),  # wxyz
+            "geom_pos": model.geom_pos[mesh_geom].tolist(),
+            "geom_quat": model.geom_quat[mesh_geom].tolist(),  # wxyz
+        }
+        if tn > 0:
+            entry["texcoords"] = model.mesh_texcoord[t0 : t0 + tn].tolist()
+            face_texcoord_attr = getattr(model, "mesh_facetexcoord", None)
+            if face_texcoord_attr is not None and len(face_texcoord_attr) > 0:
+                entry["face_texcoords"] = face_texcoord_attr[f0 : f0 + fn].tolist()
+
+        rgba = model.geom_rgba[mesh_geom].tolist()
+        if rgba != [0.5, 0.5, 0.5, 1.0]:  # MuJoCo's material-driven default
+            entry["rgba"] = rgba
+
+        texture_path = OBJECT_TEXTURES.get(name)
+        if texture_path:
+            entry["texture"] = f"/static/{texture_path}"
+
+        out[name] = entry
+
+    return out
 
 
 def describe_arm_rig(scene: EpisodeScene) -> dict[str, Any]:
@@ -342,6 +462,10 @@ def build_app(config_path: str, policy_name: str, primary_camera_override: str |
             # needs to draw the actual scene instead of a single guessed
             # slab. Static per session (read once, not per WS tick).
             "static_scene": describe_static_scene(scene),
+            # Real visual meshes (vertices/faces/UVs) for tracked objects
+            # that have one -- plate/cup/spoon/fork -- read from the same
+            # compiled model the physics uses, not a guessed sphere/box.
+            "object_meshes": describe_object_meshes(scene),
         }
 
     @app.websocket("/ws")
