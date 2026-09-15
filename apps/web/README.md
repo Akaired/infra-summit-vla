@@ -20,14 +20,16 @@ which still applies.
   capsule/box geoms — so the frontend can rebuild the *exact* rig
   `sim/assets/dinner_table_dual_so101.xml` defines instead of guessing
   proportions.
-- `index.html` — three.js scene. Builds that kinematic chain as nested
-  `Object3D` pivots (mirroring the MJCF's nested `<body>` structure) and
-  rotates/translates them from every WebSocket `robot_state` update — so the
-  viewer's arm pose **is** the physics state, not a separate animation. Table
-  objects (plate/cup/cutlery/bottle) are simple primitives positioned from
-  the same live state; a full YCB mesh import was judged not worth the time
-  against tonight's deadline (the rig itself has no mesh geometry to import
-  anyway — see below).
+- `index.html` — three.js scene, arms rendered via the **real SO-101 URDF +
+  STL meshes** (`apps/web/static/so101/`, from
+  [`TheRobotStudio/SO-ARM100`](https://github.com/TheRobotStudio/SO-ARM100),
+  Apache-2.0), loaded twice at runtime with `urdf-loader` — one `URDFRobot`
+  instance per arm. Each instance is positioned at the compiled MJCF's
+  `left_arm_base` / `right_arm_base` offset (from `GET /api/info`'s
+  `arm_rig.bases`), so the real meshes sit where the sim's placeholder arms
+  sit. Table objects (plate/cup/cutlery/bottle) are simple primitives
+  positioned from the same live state; a full YCB mesh import was judged not
+  worth the time against tonight's deadline.
 - The chat box sends whatever text you type straight through as the
   `instruction` string on every policy tick — no private command grammar,
   so what you see is exactly what the policy is actually being asked.
@@ -36,12 +38,26 @@ which still applies.
 
 `sim/assets/dinner_table_dual_so101.xml` is explicitly a placeholder: the
 arms are built from primitive capsules/boxes (5 revolute joints + 1 slide
-gripper per arm), not real SO-101 meshes or a URDF. There is currently no
-mesh-accurate rig anywhere in this repo to import. If a real SO-101 MJCF/URDF
-ever replaces the placeholder, `describe_arm_rig()` in `server.py` needs no
-change — it reads geometry from the compiled model generically — but
-`meshFromMujocoGeom()` in `index.html` only knows capsule/cylinder/box; a
-mesh-based rig would need a mesh loader added there too.
+gripper per arm), not real SO-101 meshes — it's a physics stand-in, not a
+visual one. The **viewer no longer renders that placeholder geometry at
+all**: `index.html` loads the real SO-101 URDF/STL rig instead (see above).
+
+Because the URDF is a different skeleton than the MJCF placeholder (different
+joint names, slightly different proportions), the mapping from sim state to
+rendered pose is by **index, not name**: `robot_state`'s first 6 actuated
+qpos values (this arm's qpos, in actuator order) drive the URDF's own 6
+joints in its natural base-to-gripper order — `shoulder_pan, shoulder_lift,
+elbow_flex, wrist_flex, wrist_roll, gripper` — via `ARM_JOINT_ORDER` in
+`index.html`. Motion is faithful to the real policy's action sequence and
+timing; absolute pose will not match the sim's capsule geometry
+pixel-for-pixel. `describe_arm_rig()` in `server.py` is unchanged and still
+only used to place the two arm bases (`arm_rig.bases`) — its per-link
+`arm_rig.links` geometry (capsule/box sizes) is no longer consumed by the
+frontend now that meshes come from the URDF instead.
+
+If a real SO-101 MJCF ever replaces the placeholder in `sim/assets/`, this
+index-based mapping should be revisited — a name-based mapping would then be
+possible and more robust.
 
 ## Run it
 

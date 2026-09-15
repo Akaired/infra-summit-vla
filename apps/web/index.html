@@ -140,16 +140,29 @@
 </div>
 
 <script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
+<!-- urdf-loader's UMD build wants THREE.STLLoader / THREE.ColladaLoader as
+     properties on the THREE global (see apps/web/README.md) -- these two
+     must load, in this order, before URDFLoader.js below. -->
+<script src="https://cdn.jsdelivr.net/npm/three@0.128.0/examples/js/loaders/STLLoader.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/three@0.128.0/examples/js/loaders/ColladaLoader.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/urdf-loader@0.12.1/umd/URDFLoader.js"></script>
 <script>
 // ---------------------------------------------------------------------------
-// Minimal live viewer: renders robot/object positions received over the
-// WebSocket as simple 3D primitives (boxes/spheres), not a full URDF mesh
-// import — that is a bigger lift than tonight allows and the objects/robot
-// XML in sim/assets already carry real geometry that a MuJoCo-side video
-// captures for the graded deliverable. This view exists to show the LIVE
-// loop (chat -> policy -> physics) responding in real time, not to be a
-// pixel-accurate renderer. Swap in urdf-loader against
-// sim/assets/dinner_table_dual_so101.xml later if there's time left.
+// Real SO-101 rig: the actual TheRobotStudio/SO-ARM100 URDF + STL meshes
+// (apps/web/static/so101/, Apache-2.0), loaded via urdf-loader. Two
+// instances are built -- one per arm -- and positioned at the compiled
+// MJCF's left_arm_base / right_arm_base offsets (from GET /api/info's
+// arm_rig.bases), so they sit where the sim's placeholder arms sit.
+//
+// The URDF's own joint names/proportions do NOT match the sim's placeholder
+// rig (sim/assets/dinner_table_dual_so101.xml is explicitly a stand-in, see
+// its header comment) -- there is no mesh-accurate rig anywhere in this repo
+// to match exactly. Each arm's 6 qpos values (5 arm joints + gripper, in
+// actuator order) are mapped by INDEX onto the URDF's 6 joints in its own
+// natural chain order (shoulder_pan, shoulder_lift, elbow_flex, wrist_flex,
+// wrist_roll, gripper) -- see ARM_JOINT_ORDER below. Motion is faithful to
+// the real policy's action sequence and timing; absolute pose will not
+// match the sim's simplified capsule geometry pixel-for-pixel.
 // ---------------------------------------------------------------------------
 
 const viewport = document.getElementById('viewport');
@@ -207,128 +220,78 @@ function meshForObject(name) {
 }
 
 // ---------------------------------------------------------------------------
-// Arm rig: rebuilt from the exact geometry MuJoCo compiled
-// (sim/assets/dinner_table_dual_so101.xml) — link offsets, joint axes/ranges,
-// and each link's own capsule/box geoms — served once via GET /api/info as
-// arm_rig. Each joint becomes one three.js Object3D pivot; each link's mesh
-// is a child of its own joint pivot, exactly mirroring the MJCF's nested
-// <body> chain. Every WS "state" message's robot_state (actuated qpos, in
-// actuator order) rotates/translates these pivots — no separate animation
-// data, this IS the physics state.
+// Real SO-101 arms via urdf-loader. Two independent robot instances (left,
+// right) are loaded from the same URDF and positioned at the compiled MJCF's
+// left_arm_base / right_arm_base offsets (GET /api/info -> arm_rig.bases),
+// so they sit roughly where the sim's placeholder arms sit.
 // ---------------------------------------------------------------------------
 
-const armMaterial = new THREE.MeshStandardMaterial({ color: 0x7f8494 });
-const fingerMaterial = new THREE.MeshStandardMaterial({ color: 0x2a2d33 });
-const baseMaterial = new THREE.MeshStandardMaterial({ color: 0x4a4f5c });
+// The URDF's own joint chain, base-to-gripper (so101_new_calib.urdf).
+// Index i here receives robot_state[i] (this arm's i-th actuated qpos, in
+// actuator order) -- see the module docstring above for why this is an
+// index mapping, not a name mapping: the URDF and the sim's placeholder rig
+// are different skeletons with different joint names.
+const ARM_JOINT_ORDER = [
+  'shoulder_pan', 'shoulder_lift', 'elbow_flex', 'wrist_flex', 'wrist_roll', 'gripper',
+];
 
-// MuJoCo geom size semantics per type, as this rig actually uses them:
-//   capsule: size = [radius, half-length] (when using pos+quat, as fromto
-//            compiles to) -> THREE CapsuleGeometry(radius, length, ...)
-//   cylinder: size = [radius, half-height]
-//   box: size = [half-x, half-y, half-z] (MuJoCo half-extents -> THREE full)
-function meshFromMujocoGeom(g) {
-  let geometry;
-  if (g.type === 'capsule') {
-    const [radius, halfLen] = g.size;
-    geometry = new THREE.CapsuleGeometry(radius, halfLen * 2, 4, 8);
-    // THREE capsules run along Y by default; MuJoCo capsules (from fromto)
-    // are compiled with their own local Z along the segment via geom_quat,
-    // so rotate the mesh -90deg about X to align THREE's Y-capsule with the
-    // MuJoCo-local Z-axis convention before applying that geom_quat.
-    geometry.rotateX(Math.PI / 2);
-  } else if (g.type === 'cylinder') {
-    const [radius, halfHeight] = g.size;
-    geometry = new THREE.CylinderGeometry(radius, radius, halfHeight * 2, 16);
-  } else {
-    const [hx, hy, hz] = g.size;
-    geometry = new THREE.BoxGeometry(hx * 2, hy * 2, hz * 2);
-  }
-  const isFinger = false;
-  const mesh = new THREE.Mesh(geometry, armMaterial);
-  mesh.position.set(g.pos[0], g.pos[2], g.pos[1]); // mujoco z-up -> three y-up
-  if (g.quat) {
-    // mujoco quat is (w,x,y,z); three.js Quaternion is (x,y,z,w).
-    const [w, x, y, z] = g.quat;
-    // Swap y/z to match the same z-up -> y-up axis remap used for position.
-    mesh.quaternion.set(x, z, y, -w);
-  }
-  return mesh;
+const urdfRobots = {}; // 'left' | 'right' -> URDFRobot instance
+let armsReady = false;
+
+function loadArm(side, basePosMujoco) {
+  const manager = new THREE.LoadingManager();
+  const loader = new URDFLoader(manager);
+  loader.packages = { '': '/static/so101/' };
+  loader.load('/static/so101/so101_new_calib.urdf', (robot) => {
+    // mujoco z-up -> three y-up, same remap used for objects.
+    robot.position.set(basePosMujoco[0], basePosMujoco[2], basePosMujoco[1]);
+    // The right arm faces the opposite way across the table.
+    if (side === 'right') robot.rotation.y = Math.PI;
+    robot.traverse((c) => {
+      if (c.isMesh) {
+        c.material = new THREE.MeshStandardMaterial({
+          color: side === 'left' ? 0xe0b04a : 0xe06a6a,
+          metalness: 0.15,
+          roughness: 0.65,
+        });
+      }
+    });
+    scene3d.add(robot);
+    urdfRobots[side] = robot;
+    armsReady = true;
+  });
 }
-
-const jointPivots = {}; // joint_name -> THREE.Object3D (rotates/slides on tick)
-const armRoots = {};    // base body name -> THREE.Object3D
 
 function buildArmRig(rig) {
-  if (!rig) return;
-
-  for (const [baseName, base] of Object.entries(rig.bases || {})) {
-    const root = new THREE.Object3D();
-    root.position.set(base.body_pos[0], base.body_pos[2], base.body_pos[1]);
-    for (const g of base.geoms) {
-      const m = meshFromMujocoGeom(g);
-      m.material = baseMaterial;
-      root.add(m);
-    }
-    scene3d.add(root);
-    armRoots[baseName] = root;
-  }
-
-  // links arrive in actuator order, which for this rig is parent-to-child
-  // per arm (joint1..joint5, then gripper) — build pivots in that order so
-  // each parent already exists when its child attaches.
-  const pivotByBody = {}; // body_name -> pivot Object3D
-  for (const [baseName, root] of Object.entries(armRoots)) {
-    // arm_rig body names are like "left_link1"; the base body itself has no
-    // joint, so seed the chain with the root as "left_arm_base".
-    pivotByBody[baseName] = root;
-  }
-
-  for (const link of rig.links || []) {
-    const parentPivot = pivotByBody[link.parent_body];
-    if (!parentPivot) continue; // parent not built yet or unknown — skip defensively
-
-    const pivot = new THREE.Object3D();
-    pivot.position.set(link.body_pos[0], link.body_pos[2], link.body_pos[1]);
-    parentPivot.add(pivot);
-    pivotByBody[link.body_name] = pivot;
-    jointPivots[link.joint_name] = {
-      pivot,
-      axis: link.axis,
-      type: link.joint_type,
-      baseOffset: pivot.position.clone(),
-    };
-
-    for (const g of link.geoms) {
-      const m = meshFromMujocoGeom(g);
-      m.material = /finger/.test(link.body_name) ? fingerMaterial : armMaterial;
-      pivot.add(m);
-    }
-  }
+  // rig.bases gives the sim's left_arm_base / right_arm_base world offsets
+  // (configs/sim.yaml-driven, never hardcoded here) -- reuse those so the
+  // real URDF arms sit where the physics actually places the placeholder
+  // ones, even though the meshes themselves come from a different skeleton.
+  const leftBase = rig?.bases?.left_arm_base?.body_pos;
+  const rightBase = rig?.bases?.right_arm_base?.body_pos;
+  loadArm('left', leftBase || [-0.55, 0, 0.75]);
+  loadArm('right', rightBase || [0.55, 0, 0.75]);
 }
-
-let jointOrder = []; // joint_name list, actuator order — filled from arm_rig
 
 function applyRobotState(robotState) {
   // robot_state = [actuated qpos...] then [actuated qvel...] (eval/scene.py
-  // EpisodeScene.robot_state), actuator order. We only need the qpos half.
-  if (!robotState || jointOrder.length === 0) return;
-  const nJoints = jointOrder.length;
-  for (let i = 0; i < nJoints; i++) {
-    const name = jointOrder[i];
-    const entry = jointPivots[name];
-    if (!entry) continue;
-    const qpos = robotState[i];
-    const [ax, ay, az] = entry.axis; // mujoco xyz
-    // mujoco z-up -> three y-up axis remap, matching positions above.
-    const threeAxis = new THREE.Vector3(ax, az, ay).normalize();
-    if (entry.type === 'mjJNT_SLIDE') {
-      entry.pivot.position.copy(
-        entry.baseOffset.clone().add(threeAxis.clone().multiplyScalar(qpos))
-      );
-    } else {
-      entry.pivot.quaternion.setFromAxisAngle(threeAxis, qpos);
-    }
-  }
+  // EpisodeScene.robot_state), actuator order: this rig's convention is
+  // left arm's 6 values first, then right arm's 6 (see configs/sim.yaml
+  // robot.left_arm_prefix / right_arm_prefix and smolvla_rollout.yaml's
+  // actuator_names ordering). Only the qpos half (first 12) is used.
+  if (!robotState || !armsReady) return;
+  const perArm = ARM_JOINT_ORDER.length;
+  ['left', 'right'].forEach((side, armIndex) => {
+    const robot = urdfRobots[side];
+    if (!robot) return;
+    const offset = armIndex * perArm;
+    ARM_JOINT_ORDER.forEach((jointName, i) => {
+      const value = robotState[offset + i];
+      if (typeof value === 'number' && Number.isFinite(value)) {
+        robot.setJointValue(jointName, value);
+      }
+    });
+  });
 }
 
 function animate() {
@@ -447,16 +410,11 @@ async function loadInfo() {
     });
 
     if (info.arm_rig) {
+      // Positions the two real URDF arms at the sim's base offsets; the
+      // actual per-joint mapping is the fixed ARM_JOINT_ORDER index scheme
+      // above (URDF joint names, not the MJCF's), so arm_rig.links (the
+      // MJCF's own joint/actuator list) isn't needed here anymore.
       buildArmRig(info.arm_rig);
-      // robot_state's qpos half is indexed by actuator id (eval/scene.py
-      // EpisodeScene.robot_state iterates model.nu in order). Build the
-      // joint-name array by that same actuator_index rather than trusting
-      // arrival order, so a future actuator that ISN'T left_/right_-prefixed
-      // (filtered out server-side) can't silently shift this mapping.
-      jointOrder = [];
-      for (const link of info.arm_rig.links || []) {
-        jointOrder[link.actuator_index] = link.joint_name;
-      }
     }
   } catch (err) {
     logLine('failed to load /api/info: ' + err, 'err');
