@@ -86,6 +86,28 @@ Dependencies are only partially pinned: `pyproject.toml` still carries empty
 `sim` / `inference` / `eval` extras that get populated as each module stabilizes.
 The full command list lives in [`CLAUDE.md`](./CLAUDE.md#toolchain-and-commands).
 
+## Web viewer
+
+From the repository root, start the local viewer with the dummy policy:
+
+```bash
+uv run --frozen \
+  --extra sim \
+  --extra dummy \
+  --with fastapi \
+  --with "uvicorn[standard]" \
+  python apps/web/server.py --config configs/eval.yaml --policy dummy
+```
+
+Then open <http://localhost:8000>, choose a seed, enter an instruction such as
+`open the top drawer`, and press **Send**. The server listens on `0.0.0.0`, so
+another device on the same network can use `http://<machine-ip>:8000`.
+
+The viewer calls the shared `eval.policy_interface.build_policy()` factory. Once
+the inference runtime implements its `openvino` branch, start the same viewer
+with `--policy openvino`; no viewer-side policy integration is required. See
+[`apps/web/README.md`](./apps/web/README.md) for its architecture and controls.
+
 ## No hardcoded values
 
 The PRD's strictest rule (§5): scene and asset paths, seed lists, randomization

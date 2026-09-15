@@ -1,6 +1,6 @@
 # `/apps/web` — live demo viewer (optional, not graded)
 
-**Branch:** `feature/viewer` · **Status:** implemented, not yet run against a real OpenVINO backend
+**Status:** available on `main`; not yet run against a real OpenVINO backend
 
 A live three.js viewer + chat box: type an instruction, watch the bimanual
 episode run in the browser in real time. Polish for the demonstration/pitch,
@@ -53,14 +53,17 @@ conversion and applies live joint state.
 ## Run it
 
 ```bash
-# same venv as eval/run_episodes.py
-pip install fastapi "uvicorn[standard]"
-
-# dummy policy (works today, no checkpoint needed)
-python apps/web/server.py --config configs/eval.yaml --policy dummy
+# Run from the repository root. The transient --with dependencies do not
+# modify uv.lock.
+uv run --frozen \
+  --extra sim \
+  --extra dummy \
+  --with fastapi \
+  --with "uvicorn[standard]" \
+  python apps/web/server.py --config configs/eval.yaml --policy dummy
 
 # real backend, once /inference exposes an eval.policy_interface.Policy
-python apps/web/server.py --config configs/eval.yaml --policy openvino
+# replace the final `dummy` above with `openvino`
 ```
 
 Open `http://localhost:8000` (or `http://<machine-ip>:8000` from another
