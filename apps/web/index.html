@@ -1,0 +1,470 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<title>Vino &amp; Dine — Live Demo</title>
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<style>
+  :root {
+    --bg: #0b0d12;
+    --panel: #12151c;
+    --panel-2: #181c25;
+    --border: #262b36;
+    --text: #e7e9ee;
+    --muted: #8b93a3;
+    --accent: #7dd3a8;
+    --accent-2: #e0b04a;
+    --danger: #e06a6a;
+  }
+  * { box-sizing: border-box; }
+  html, body {
+    margin: 0; padding: 0; height: 100%;
+    background: var(--bg); color: var(--text);
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Inter, sans-serif;
+  }
+  #app {
+    display: grid;
+    grid-template-columns: 1fr 340px;
+    grid-template-rows: 56px 1fr;
+    height: 100vh;
+  }
+  header {
+    grid-column: 1 / 3;
+    display: flex; align-items: center; gap: 12px;
+    padding: 0 16px;
+    background: var(--panel);
+    border-bottom: 1px solid var(--border);
+  }
+  header h1 { font-size: 15px; font-weight: 600; margin: 0; }
+  header .sub { color: var(--muted); font-size: 12px; }
+  #status-dot {
+    width: 9px; height: 9px; border-radius: 50%;
+    background: var(--danger);
+    box-shadow: 0 0 6px var(--danger);
+  }
+  #status-dot.connected { background: var(--accent); box-shadow: 0 0 6px var(--accent); }
+  #viewport { position: relative; background: #05070a; }
+  #viewport canvas { display: block; }
+  #viewport-overlay {
+    position: absolute; top: 12px; left: 12px;
+    font-size: 11px; color: var(--muted);
+    background: rgba(10,12,16,0.6); padding: 6px 10px; border-radius: 6px;
+    pointer-events: none;
+  }
+  #sidebar {
+    display: flex; flex-direction: column;
+    background: var(--panel);
+    border-left: 1px solid var(--border);
+    overflow: hidden;
+  }
+  #seed-row {
+    display: flex; align-items: center; gap: 8px;
+    padding: 12px 14px; border-bottom: 1px solid var(--border);
+  }
+  #seed-row label { font-size: 12px; color: var(--muted); }
+  select, button, input[type=text] {
+    background: var(--panel-2); color: var(--text);
+    border: 1px solid var(--border); border-radius: 6px;
+    padding: 6px 8px; font-size: 13px;
+  }
+  button { cursor: pointer; }
+  button:hover { border-color: var(--accent); }
+  button.primary { background: var(--accent); color: #06110b; border-color: var(--accent); font-weight: 600; }
+  button.stop { border-color: var(--danger); color: var(--danger); background: transparent; }
+  #subtasks { padding: 12px 14px; border-bottom: 1px solid var(--border); }
+  #subtasks h2, #log h2 { font-size: 11px; text-transform: uppercase; letter-spacing: .06em; color: var(--muted); margin: 0 0 8px; }
+  .subtask-row { display: flex; align-items: center; gap: 8px; font-size: 12.5px; padding: 3px 0; }
+  .badge { width: 8px; height: 8px; border-radius: 50%; flex: none; }
+  .badge.completed { background: var(--accent); }
+  .badge.incomplete { background: #3a4050; }
+  .badge.not_implemented { background: #4a4030; }
+  .subtask-name { flex: 1; }
+  .subtask-status { color: var(--muted); font-size: 10.5px; text-transform: uppercase; }
+  #log {
+    flex: 1; display: flex; flex-direction: column; min-height: 0;
+    padding: 12px 14px;
+  }
+  #log-lines {
+    flex: 1; overflow-y: auto; font-size: 12px; color: var(--muted);
+    display: flex; flex-direction: column-reverse; gap: 4px;
+  }
+  #log-lines .line { color: var(--text); }
+  #log-lines .line.you { color: var(--accent-2); }
+  #log-lines .line.err { color: var(--danger); }
+  #chat-row {
+    display: flex; gap: 6px; padding: 12px 14px; border-top: 1px solid var(--border);
+  }
+  #chat-input { flex: 1; }
+  #meta { padding: 10px 14px; font-size: 11px; color: var(--muted); border-top: 1px solid var(--border); }
+</style>
+</head>
+<body>
+<div id="app">
+  <header>
+    <div id="status-dot"></div>
+    <h1>Vino &amp; Dine — Bimanual VLA</h1>
+    <span class="sub">local viewer · not graded · real policy behind it</span>
+  </header>
+
+  <div id="viewport">
+    <div id="viewport-overlay">seed: <span id="ov-seed">–</span> · step: <span id="ov-step">0</span></div>
+  </div>
+
+  <div id="sidebar">
+    <div id="seed-row">
+      <label for="seed-select">Seed</label>
+      <select id="seed-select"></select>
+      <button id="reset-btn">Reset</button>
+    </div>
+
+    <div id="subtasks">
+      <h2>Subtasks</h2>
+      <div id="subtask-list"><span class="sub" style="color:var(--muted)">waiting for scene…</span></div>
+    </div>
+
+    <div id="log">
+      <h2>Command log</h2>
+      <div id="log-lines"></div>
+    </div>
+
+    <div id="chat-row">
+      <input id="chat-input" type="text" placeholder="e.g. open the top drawer" />
+      <button id="send-btn" class="primary">Send</button>
+      <button id="stop-btn" class="stop">Stop</button>
+    </div>
+
+    <div id="meta">
+      policy: <span id="meta-policy">–</span> · camera: <span id="meta-camera">–</span>
+    </div>
+  </div>
+</div>
+
+<script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
+<script>
+// ---------------------------------------------------------------------------
+// Minimal live viewer: renders robot/object positions received over the
+// WebSocket as simple 3D primitives (boxes/spheres), not a full URDF mesh
+// import — that is a bigger lift than tonight allows and the objects/robot
+// XML in sim/assets already carry real geometry that a MuJoCo-side video
+// captures for the graded deliverable. This view exists to show the LIVE
+// loop (chat -> policy -> physics) responding in real time, not to be a
+// pixel-accurate renderer. Swap in urdf-loader against
+// sim/assets/dinner_table_dual_so101.xml later if there's time left.
+// ---------------------------------------------------------------------------
+
+const viewport = document.getElementById('viewport');
+const scene3d = new THREE.Scene();
+scene3d.background = new THREE.Color(0x05070a);
+
+const camera = new THREE.PerspectiveCamera(45, 1, 0.01, 50);
+camera.position.set(1.1, 0.9, 1.1);
+camera.lookAt(0, 0.3, 0);
+
+const renderer = new THREE.WebGLRenderer({ antialias: true });
+viewport.appendChild(renderer.domElement);
+
+function resizeRenderer() {
+  const w = viewport.clientWidth, h = viewport.clientHeight;
+  renderer.setSize(w, h);
+  camera.aspect = w / h;
+  camera.updateProjectionMatrix();
+}
+window.addEventListener('resize', resizeRenderer);
+
+scene3d.add(new THREE.AmbientLight(0xffffff, 0.6));
+const dirLight = new THREE.DirectionalLight(0xffffff, 0.8);
+dirLight.position.set(1, 2, 1);
+scene3d.add(dirLight);
+
+// table
+const table = new THREE.Mesh(
+  new THREE.BoxGeometry(1.2, 0.05, 0.7),
+  new THREE.MeshStandardMaterial({ color: 0x2a2f3a })
+);
+table.position.set(0, 0, 0);
+scene3d.add(table);
+
+const grid = new THREE.GridHelper(2, 20, 0x2a2f3a, 0x1a1e26);
+grid.position.y = -0.001;
+scene3d.add(grid);
+
+const objectMeshes = {};
+const OBJECT_COLORS = {
+  plate: 0xe7e9ee, cup: 0x7dd3a8, mug: 0x7dd3a8, bottle: 0x4a90d9, drawer: 0x8b6a3a,
+};
+
+function meshForObject(name) {
+  if (objectMeshes[name]) return objectMeshes[name];
+  const isCutlery = /^(spoon|fork)/.test(name);
+  const geom = isCutlery
+    ? new THREE.BoxGeometry(0.02, 0.01, 0.12)
+    : new THREE.SphereGeometry(0.045, 16, 16);
+  const color = OBJECT_COLORS[name.replace(/_\d+$/, '')] ?? 0xaaaaaa;
+  const mesh = new THREE.Mesh(geom, new THREE.MeshStandardMaterial({ color }));
+  scene3d.add(mesh);
+  objectMeshes[name] = mesh;
+  return mesh;
+}
+
+// ---------------------------------------------------------------------------
+// Arm rig: rebuilt from the exact geometry MuJoCo compiled
+// (sim/assets/dinner_table_dual_so101.xml) — link offsets, joint axes/ranges,
+// and each link's own capsule/box geoms — served once via GET /api/info as
+// arm_rig. Each joint becomes one three.js Object3D pivot; each link's mesh
+// is a child of its own joint pivot, exactly mirroring the MJCF's nested
+// <body> chain. Every WS "state" message's robot_state (actuated qpos, in
+// actuator order) rotates/translates these pivots — no separate animation
+// data, this IS the physics state.
+// ---------------------------------------------------------------------------
+
+const armMaterial = new THREE.MeshStandardMaterial({ color: 0x7f8494 });
+const fingerMaterial = new THREE.MeshStandardMaterial({ color: 0x2a2d33 });
+const baseMaterial = new THREE.MeshStandardMaterial({ color: 0x4a4f5c });
+
+// MuJoCo geom size semantics per type, as this rig actually uses them:
+//   capsule: size = [radius, half-length] (when using pos+quat, as fromto
+//            compiles to) -> THREE CapsuleGeometry(radius, length, ...)
+//   cylinder: size = [radius, half-height]
+//   box: size = [half-x, half-y, half-z] (MuJoCo half-extents -> THREE full)
+function meshFromMujocoGeom(g) {
+  let geometry;
+  if (g.type === 'capsule') {
+    const [radius, halfLen] = g.size;
+    geometry = new THREE.CapsuleGeometry(radius, halfLen * 2, 4, 8);
+    // THREE capsules run along Y by default; MuJoCo capsules (from fromto)
+    // are compiled with their own local Z along the segment via geom_quat,
+    // so rotate the mesh -90deg about X to align THREE's Y-capsule with the
+    // MuJoCo-local Z-axis convention before applying that geom_quat.
+    geometry.rotateX(Math.PI / 2);
+  } else if (g.type === 'cylinder') {
+    const [radius, halfHeight] = g.size;
+    geometry = new THREE.CylinderGeometry(radius, radius, halfHeight * 2, 16);
+  } else {
+    const [hx, hy, hz] = g.size;
+    geometry = new THREE.BoxGeometry(hx * 2, hy * 2, hz * 2);
+  }
+  const isFinger = false;
+  const mesh = new THREE.Mesh(geometry, armMaterial);
+  mesh.position.set(g.pos[0], g.pos[2], g.pos[1]); // mujoco z-up -> three y-up
+  if (g.quat) {
+    // mujoco quat is (w,x,y,z); three.js Quaternion is (x,y,z,w).
+    const [w, x, y, z] = g.quat;
+    // Swap y/z to match the same z-up -> y-up axis remap used for position.
+    mesh.quaternion.set(x, z, y, -w);
+  }
+  return mesh;
+}
+
+const jointPivots = {}; // joint_name -> THREE.Object3D (rotates/slides on tick)
+const armRoots = {};    // base body name -> THREE.Object3D
+
+function buildArmRig(rig) {
+  if (!rig) return;
+
+  for (const [baseName, base] of Object.entries(rig.bases || {})) {
+    const root = new THREE.Object3D();
+    root.position.set(base.body_pos[0], base.body_pos[2], base.body_pos[1]);
+    for (const g of base.geoms) {
+      const m = meshFromMujocoGeom(g);
+      m.material = baseMaterial;
+      root.add(m);
+    }
+    scene3d.add(root);
+    armRoots[baseName] = root;
+  }
+
+  // links arrive in actuator order, which for this rig is parent-to-child
+  // per arm (joint1..joint5, then gripper) — build pivots in that order so
+  // each parent already exists when its child attaches.
+  const pivotByBody = {}; // body_name -> pivot Object3D
+  for (const [baseName, root] of Object.entries(armRoots)) {
+    // arm_rig body names are like "left_link1"; the base body itself has no
+    // joint, so seed the chain with the root as "left_arm_base".
+    pivotByBody[baseName] = root;
+  }
+
+  for (const link of rig.links || []) {
+    const parentPivot = pivotByBody[link.parent_body];
+    if (!parentPivot) continue; // parent not built yet or unknown — skip defensively
+
+    const pivot = new THREE.Object3D();
+    pivot.position.set(link.body_pos[0], link.body_pos[2], link.body_pos[1]);
+    parentPivot.add(pivot);
+    pivotByBody[link.body_name] = pivot;
+    jointPivots[link.joint_name] = {
+      pivot,
+      axis: link.axis,
+      type: link.joint_type,
+      baseOffset: pivot.position.clone(),
+    };
+
+    for (const g of link.geoms) {
+      const m = meshFromMujocoGeom(g);
+      m.material = /finger/.test(link.body_name) ? fingerMaterial : armMaterial;
+      pivot.add(m);
+    }
+  }
+}
+
+let jointOrder = []; // joint_name list, actuator order — filled from arm_rig
+
+function applyRobotState(robotState) {
+  // robot_state = [actuated qpos...] then [actuated qvel...] (eval/scene.py
+  // EpisodeScene.robot_state), actuator order. We only need the qpos half.
+  if (!robotState || jointOrder.length === 0) return;
+  const nJoints = jointOrder.length;
+  for (let i = 0; i < nJoints; i++) {
+    const name = jointOrder[i];
+    const entry = jointPivots[name];
+    if (!entry) continue;
+    const qpos = robotState[i];
+    const [ax, ay, az] = entry.axis; // mujoco xyz
+    // mujoco z-up -> three y-up axis remap, matching positions above.
+    const threeAxis = new THREE.Vector3(ax, az, ay).normalize();
+    if (entry.type === 'mjJNT_SLIDE') {
+      entry.pivot.position.copy(
+        entry.baseOffset.clone().add(threeAxis.clone().multiplyScalar(qpos))
+      );
+    } else {
+      entry.pivot.quaternion.setFromAxisAngle(threeAxis, qpos);
+    }
+  }
+}
+
+function animate() {
+  requestAnimationFrame(animate);
+  renderer.render(scene3d, camera);
+}
+resizeRenderer();
+animate();
+
+// ---------------------------------------------------------------------------
+// WebSocket wiring
+// ---------------------------------------------------------------------------
+
+const statusDot = document.getElementById('status-dot');
+const seedSelect = document.getElementById('seed-select');
+const resetBtn = document.getElementById('reset-btn');
+const subtaskList = document.getElementById('subtask-list');
+const logLines = document.getElementById('log-lines');
+const chatInput = document.getElementById('chat-input');
+const sendBtn = document.getElementById('send-btn');
+const stopBtn = document.getElementById('stop-btn');
+const ovSeed = document.getElementById('ov-seed');
+const ovStep = document.getElementById('ov-step');
+const metaPolicy = document.getElementById('meta-policy');
+const metaCamera = document.getElementById('meta-camera');
+
+function logLine(text, cls) {
+  const div = document.createElement('div');
+  div.className = 'line' + (cls ? ' ' + cls : '');
+  div.textContent = text;
+  logLines.prepend(div);
+  while (logLines.childElementCount > 200) logLines.removeChild(logLines.lastChild);
+}
+
+let ws;
+let currentSeed = 0;
+
+function connect() {
+  const proto = location.protocol === 'https:' ? 'wss' : 'ws';
+  ws = new WebSocket(`${proto}://${location.host}/ws`);
+
+  ws.onopen = () => { statusDot.classList.add('connected'); logLine('connected'); };
+  ws.onclose = () => {
+    statusDot.classList.remove('connected');
+    logLine('disconnected — retrying in 2s', 'err');
+    setTimeout(connect, 2000);
+  };
+  ws.onerror = () => {};
+  ws.onmessage = (event) => {
+    let msg;
+    try { msg = JSON.parse(event.data); } catch { return; }
+    if (msg.type === 'error') { logLine('error: ' + msg.message, 'err'); return; }
+    if (msg.type === 'state') applyState(msg);
+  };
+}
+
+function applyState(msg) {
+  if (typeof msg.seed === 'number') { currentSeed = msg.seed; ovSeed.textContent = msg.seed; }
+  ovStep.textContent = msg.policy_steps ?? 0;
+
+  if (msg.objects) {
+    for (const [name, pos] of Object.entries(msg.objects)) {
+      const mesh = meshForObject(name);
+      // sim frame: x,y,z meters -> viewer uses y-up, sim likely z-up.
+      mesh.position.set(pos[0], pos[2], pos[1]);
+    }
+  }
+
+  if (msg.robot_state) applyRobotState(msg.robot_state);
+
+  if (msg.subtasks) renderSubtasks(msg.subtasks);
+}
+
+function renderSubtasks(subtasks) {
+  subtaskList.innerHTML = '';
+  for (const [name, status] of Object.entries(subtasks)) {
+    const row = document.createElement('div');
+    row.className = 'subtask-row';
+    row.innerHTML = `<span class="badge ${status}"></span><span class="subtask-name">${name.replace(/_/g,' ')}</span><span class="subtask-status">${status.replace('_',' ')}</span>`;
+    subtaskList.appendChild(row);
+  }
+}
+
+function sendInstruction() {
+  const text = chatInput.value.trim();
+  if (!text || !ws || ws.readyState !== WebSocket.OPEN) return;
+  logLine('you: ' + text, 'you');
+  ws.send(JSON.stringify({ type: 'instruction', text }));
+  chatInput.value = '';
+}
+
+sendBtn.addEventListener('click', sendInstruction);
+chatInput.addEventListener('keydown', (e) => { if (e.key === 'Enter') sendInstruction(); });
+stopBtn.addEventListener('click', () => {
+  if (ws && ws.readyState === WebSocket.OPEN) { ws.send(JSON.stringify({ type: 'stop' })); logLine('stopped'); }
+});
+resetBtn.addEventListener('click', () => {
+  const seed = parseInt(seedSelect.value, 10) || 0;
+  if (ws && ws.readyState === WebSocket.OPEN) {
+    ws.send(JSON.stringify({ type: 'reset', seed }));
+    logLine('reset to seed ' + seed);
+  }
+});
+
+async function loadInfo() {
+  try {
+    const res = await fetch('/api/info');
+    const info = await res.json();
+    metaPolicy.textContent = info.policy;
+    metaCamera.textContent = info.primary_camera;
+    seedSelect.innerHTML = '';
+    (info.seeds || [0]).forEach((s) => {
+      const opt = document.createElement('option');
+      opt.value = s; opt.textContent = 'seed ' + s;
+      seedSelect.appendChild(opt);
+    });
+
+    if (info.arm_rig) {
+      buildArmRig(info.arm_rig);
+      // robot_state's qpos half is indexed by actuator id (eval/scene.py
+      // EpisodeScene.robot_state iterates model.nu in order). Build the
+      // joint-name array by that same actuator_index rather than trusting
+      // arrival order, so a future actuator that ISN'T left_/right_-prefixed
+      // (filtered out server-side) can't silently shift this mapping.
+      jointOrder = [];
+      for (const link of info.arm_rig.links || []) {
+        jointOrder[link.actuator_index] = link.joint_name;
+      }
+    }
+  } catch (err) {
+    logLine('failed to load /api/info: ' + err, 'err');
+  }
+}
+
+loadInfo();
+connect();
+</script>
+</body>
+</html>
