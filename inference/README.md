@@ -36,7 +36,7 @@ signature**, whatever backend sits behind it. `/eval` and `/sim` know only this.
 The underlying model (SmolVLA / Pi0.5 / ACT / whatever) stays swappable behind
 that call — an explicit PRD requirement, not a nicety.
 
-## Current status: STUB
+## Current status: stub until an exported SmolVLA artifact is present
 
 No OpenVINO IR is exported yet (`/policy` does that later). Until then
 `InferenceRuntime` delegates to the model-free `DummyPolicy` in `/policy`, so
@@ -48,7 +48,11 @@ function — `_build_backend` in `runtime.py`, marked with a `TODO(inference)`:
 return _IRBackend(compile_ir_model(cfg))   # + delete the `stub:` block from the config
 ```
 
-`compile_ir_model`, `resolve_device`, and `compile_properties` are already
+When `velocity_step.xml`, `velocity_step.bin`, and `manifest.json` exist, the runtime loads
+the real `_IRBackend`. The manifest records the fixed tensor ABI and checkpoint
+used for LeRobot preprocessing/postprocessing; install `.[policy,inference]`
+for this path. `compile_ir_model`, `resolve_device`, and `compile_properties` are
+already
 written against the official device-agnostic OpenVINO pattern:
 
 - **Device selection** reads `configs/inference.yaml:device` (`CPU` / `GPU` /
