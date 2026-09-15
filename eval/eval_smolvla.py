@@ -4,7 +4,6 @@ import imageio_ffmpeg
 import mediapy
 
 import argparse
-import json
 import sys
 import time
 from pathlib import Path
@@ -17,18 +16,96 @@ import torch
 import torch.nn.functional as F
 import yaml
 
+# Declared project-wide in configs/eval.yaml:88 (placed_min_xy_displacement_m).
+DEFAULT_PLACED_MIN_XY_DISPLACEMENT_M = 0.05
+
 REPO_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO_ROOT))
+sys.path.insert(0, str(REPO_ROOT / "sim"))
+
 
 from eval.scene import EpisodeScene
 from sim.grasp_assist import GraspAssist
 from lerobot.policies.factory import make_pre_post_processors
 from lerobot.policies.smolvla.modeling_smolvla import SmolVLAPolicy
+from datetime import datetime
+from eval.determinism import (
+    enable_determinism,
+    make_render_deterministic,
+)
+from eval.json_utils import dumps_strict
 
+def select_output_directory(
+    cfg: dict[str, Any],
+    seeds: list[int],
+) -> Path:
+    """Свежий каталог под <directory>/runs для одного прогона.
 
+    Агрегат <directory>/summary.json никогда не затирается: каждый
+    прогон складывает артефакты в собственный подкаталог, поэтому
+    сравнивать два прогона можно без ручного переименования.
+    """
+    root = resolve_path(cfg["directory"]) / "runs"
+    root.mkdir(parents=True, exist_ok=True)
+
+    stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+    label = f"seeds{len(seeds)}"
+
+    for attempt in range(1, 1000):
+        candidate = root / f"{stamp}-{label}-{attempt:03d}"
+        try:
+            candidate.mkdir(exist_ok=False)
+        except FileExistsError:
+            continue
+        return candidate
+
+    raise RuntimeError(f"Нет свободного имени каталога прогона в {root}")
 def resolve_path(value: str) -> Path:
     path = Path(value)
     return path if path.is_absolute() else REPO_ROOT / path
+
+
+def deep_merge(
+    base: dict[str, Any],
+    overlay: dict[str, Any],
+) -> dict[str, Any]:
+    """Recursive dict merge; ``overlay`` wins on every leaf."""
+    merged = dict(base)
+
+    for key, value in overlay.items():
+        current = merged.get(key)
+        if isinstance(value, dict) and isinstance(current, dict):
+            merged[key] = deep_merge(current, value)
+        else:
+            merged[key] = value
+
+    return merged
+
+
+def load_rollout_config(path: str | Path) -> dict[str, Any]:
+    """Load the rollout config with the external grasp-assist config merged in.
+
+    ``configs/grasp_assist.yaml`` is the single source of truth for the
+    contact/threshold physics shared with demo collection. The rollout config
+    may only OVERRIDE keys there, never carry a private full copy -- a second
+    copy is how ``release_open_hold_policy_steps`` went missing from both
+    files and blew up mid-episode.
+    """
+    cfg = load_yaml(path)
+
+    grasp_path = cfg.get("configs", {}).get("grasp_assist")
+    if grasp_path is None:
+        raise KeyError(
+            "configs.grasp_assist must name the external grasp-assist "
+            f"config in {path}"
+        )
+
+    cfg["grasp_assist"] = deep_merge(
+        load_yaml(grasp_path),
+        cfg.get("grasp_assist") or {},
+    )
+
+    return cfg
 
 
 def load_yaml(path: str | Path) -> dict[str, Any]:
@@ -319,9 +396,11 @@ class TaskTracker:
         self,
         scene: EpisodeScene,
         cfg: dict[str, Any],
+        grasp_assist: Any | None = None,
     ) -> None:
         self.scene = scene
         self.cfg = cfg
+        self.grasp_assist = grasp_assist
         self.event_names = cfg["events"]
         self.sequence = list(cfg["sequence"])
         self.events: dict[str, int | None] = {
@@ -353,7 +432,109 @@ class TaskTracker:
         speed = self.scene.body_linear_speed(plate_cfg["body_name"])
         return position, speed
 
-    def update(self, policy_step: int) -> None:
+    # ------------------------------------------------------------------ #
+    # Grasp confirmation.
+    #
+    # Without these checks the harness confirms a lift that exists only
+    # because GraspAssist glued the plate on: the weld fires on contact at
+    # any gripper position, so a bump-and-raise latched plate_lifted with no
+    # grasp at all. A subtask counts only when the COMMANDED gripper was
+    # closed and something actually holds the plate.
+    # ------------------------------------------------------------------ #
+    def _plate_gripper_closed(self, action: np.ndarray) -> bool:
+        plate_cfg = self.cfg["plate"]
+        index = int(plate_cfg["gripper_action_index"])
+        flat = np.asarray(action, dtype=np.float64).ravel()
+
+        if index >= flat.shape[0]:
+            raise IndexError(
+                f"plate.gripper_action_index={index} is out of range for an "
+                f"action of {flat.shape[0]} values"
+            )
+
+        return bool(
+            flat[index] <= float(plate_cfg["gripper_close_threshold"])
+        )
+
+    def _weld_active(self) -> bool:
+        """True while GraspAssist still holds the plate welded to the hand."""
+        if self.grasp_assist is None:
+            return False
+        if not bool(getattr(self.grasp_assist, "enabled", False)):
+            return False
+        return bool(getattr(self.grasp_assist, "plate_active", False))
+
+    def _plate_in_gripper_contact(self) -> bool:
+        plate_cfg = self.cfg["plate"]
+        touching = set(
+            self.scene.bodies_touching(plate_cfg["body_name"])
+        )
+        jaws = set(plate_cfg["gripper_contact_bodies"])
+        return bool(touching & jaws)
+
+    def _plate_is_held(self) -> bool:
+        """Assisted weld OR a real physical grasp -- either counts."""
+        return self._weld_active() or self._plate_in_gripper_contact()
+
+    # ------------------------------------------------------------------ #
+    # Placement, measured as DISPLACEMENT from where this episode's plate
+    # spawned -- not as distance to an absolute target point.
+    #
+    # An absolute target cannot be set defensibly here. The demos aim the
+    # GRIPPER at a point sampled from scripted_episode_ik.PLACE_ZONE, whose
+    # centre is (-0.05, -0.06) rather than the table centre; that sampler
+    # falls back to a radial push outside its own zone in a sizable minority
+    # of episodes; and the plate is welded at its RIM, so its centre ends up
+    # ~0.9 * 0.089 = 0.08 m away from wherever the gripper was aimed. A
+    # radius wide enough to accept all of that accepts most of the table.
+    #
+    # Displacement + on-surface + at-rest is the criterion configs/eval.yaml
+    # already declares for the other harness, and it asks the question that
+    # matters: was the plate actually picked up and set down.
+    # ------------------------------------------------------------------ #
+    def _placement_terms(self) -> tuple[float, float, float]:
+        plate_position, plate_speed = self._plate_values()
+
+        displacement = float(
+            np.linalg.norm(
+                plate_position[:2] - self.initial_plate_position[:2]
+            )
+        )
+        surface_error = abs(
+            float(
+                plate_position[2]
+                - self.initial_plate_position[2]
+            )
+        )
+
+        return displacement, surface_error, plate_speed
+
+    def _plate_is_placed(self) -> bool:
+        plate_cfg = self.cfg["plate"]
+        displacement, surface_error, plate_speed = self._placement_terms()
+
+        return (
+            # The plate has to be LET GO. Without this a run that carries it
+            # to the target, lowers it and holds still counts as a success
+            # with the plate still welded to the gripper -- and
+            # success_hold_policy_steps makes a stalled arm look like a hold.
+            not self._weld_active()
+            and displacement
+            >= float(
+                plate_cfg.get(
+                    "placed_min_xy_displacement_m",
+                    # configs/eval.yaml:88 declares this project-wide; a
+                    # missing key must NOT silently mean "no requirement".
+                    DEFAULT_PLACED_MIN_XY_DISPLACEMENT_M,
+                )
+            )
+            and surface_error
+            <= float(plate_cfg["surface_z_tolerance_m"])
+            and plate_speed
+            <= float(plate_cfg["resting_linear_speed_mps"])
+        )
+
+    def update(self, policy_step: int, action: np.ndarray) -> None:
         names = self.event_names
         drawer_fraction = self._drawer_fraction()
         plate_position, plate_speed = self._plate_values()
@@ -390,40 +571,15 @@ class TaskTracker:
             and self.events[lifted] is None
             and lifted_delta
             >= float(self.cfg["plate"]["lifted_delta_z_m"])
+            and self._plate_gripper_closed(action)
+            and self._plate_is_held()
         ):
             self.events[lifted] = policy_step
-
-        target_xy = np.asarray(
-            self.cfg["plate"]["target_xy_m"],
-            dtype=np.float64,
-        )
-        target_distance = float(
-            np.linalg.norm(plate_position[:2] - target_xy)
-        )
-        surface_error = abs(
-            float(
-                plate_position[2]
-                - self.initial_plate_position[2]
-            )
-        )
-
-        plate_is_placed = (
-            target_distance
-            <= float(self.cfg["plate"]["target_radius_m"])
-            and surface_error
-            <= float(
-                self.cfg["plate"]["surface_z_tolerance_m"]
-            )
-            and plate_speed
-            <= float(
-                self.cfg["plate"]["resting_linear_speed_mps"]
-            )
-        )
 
         if (
             self.events[lifted] is not None
             and self.events[placed] is None
-            and plate_is_placed
+            and self._plate_is_placed()
         ):
             self.events[placed] = policy_step
 
@@ -431,46 +587,17 @@ class TaskTracker:
         if any(self.events[name] is None for name in self.sequence):
             return False
 
-        drawer_fraction = self._drawer_fraction()
-        plate_position, plate_speed = self._plate_values()
-        target_xy = np.asarray(
-            self.cfg["plate"]["target_xy_m"],
-            dtype=np.float64,
-        )
-
-        target_distance = float(
-            np.linalg.norm(plate_position[:2] - target_xy)
-        )
-        surface_error = abs(
-            float(
-                plate_position[2]
-                - self.initial_plate_position[2]
-            )
-        )
-
         return (
-            drawer_fraction
+            self._drawer_fraction()
             <= float(
                 self.cfg["drawer"]["closed_travel_fraction"]
             )
-            and target_distance
-            <= float(self.cfg["plate"]["target_radius_m"])
-            and surface_error
-            <= float(
-                self.cfg["plate"]["surface_z_tolerance_m"]
-            )
-            and plate_speed
-            <= float(
-                self.cfg["plate"]["resting_linear_speed_mps"]
-            )
+            and self._plate_is_placed()
         )
 
     def report(self) -> dict[str, Any]:
         plate_position, plate_speed = self._plate_values()
-        target_xy = np.asarray(
-            self.cfg["plate"]["target_xy_m"],
-            dtype=np.float64,
-        )
+        displacement, surface_error, _ = self._placement_terms()
 
         return {
             "success": self.currently_successful(),
@@ -483,10 +610,10 @@ class TaskTracker:
             "drawer_travel_fraction_final": self._drawer_fraction(),
             "plate_position_initial": self.initial_plate_position.tolist(),
             "plate_position_final": plate_position.tolist(),
-            "plate_target_distance_m_final": float(
-                np.linalg.norm(plate_position[:2] - target_xy)
-            ),
+            "plate_xy_displacement_m_final": displacement,
+            "plate_surface_error_m_final": surface_error,
             "plate_linear_speed_mps_final": plate_speed,
+            "plate_weld_active_final": self._weld_active(),
         }
 
 
@@ -536,17 +663,21 @@ def run_episode(
 ) -> dict[str, Any]:
     started_at = time.perf_counter()
 
-    scene.reset(seed)
-    runner.reset(seed)
-
     grasp = GraspAssist(
         model=scene.model,
         data=scene.data,
         cfg=cfg["grasp_assist"],
     )
-    grasp.reset()
 
-    tracker = TaskTracker(scene, cfg["evaluation"])
+    # grasp.reset() BEFORE scene.reset(seed): the randomizer places the
+    # objects and settles the scene, and that must happen with no equality
+    # active. scene.reset() then restores the compiled eq defaults, so it
+    # gets the last word.
+    grasp.reset()
+    scene.reset(seed)
+    runner.reset(seed)
+
+    tracker = TaskTracker(scene, cfg["evaluation"], grasp_assist=grasp)
     rollout_cfg = cfg["rollout"]
     video_cfg = cfg["output"]["video"]
 
@@ -582,7 +713,7 @@ def run_episode(
             scene.step()
 
         observation = scene.observe()
-        tracker.update(policy_step)
+        tracker.update(policy_step, action)
         policy_steps = policy_step + 1
 
         if (
@@ -649,14 +780,70 @@ def parse_seed_override(raw: str | None) -> list[int] | None:
     ]
 
 
+def resolve_determinism(
+    cfg: dict[str, Any],
+    args: argparse.Namespace,
+) -> dict[str, bool]:
+    """Эффективные настройки детерминизма: конфиг, поверх него CLI.
+
+    Значения живут в configs/*.yaml, а не в коде (CONTRIBUTING.md §3).
+    Дефолты применяются только если ключа в конфиге нет, чтобы старые
+    конфиги не падали.
+
+    render: доминирующий источник расхождения -- два подряд render()
+    одной сцены дают ±1 младший бит на всех трёх камерах, что за 600
+    шагов замкнутого контура меняет исход эпизода. По умолчанию ВКЛ.
+
+    kernels: недетерминированные CUDA-ядра, ~1e-7. Замерено как
+    второстепенное, и torch.use_deterministic_algorithms замедляет
+    прогон. По умолчанию ВЫКЛ.
+    """
+    rollout_cfg = cfg.get("rollout", {})
+
+    render = bool(rollout_cfg.get("deterministic_render", True))
+    kernels = bool(rollout_cfg.get("deterministic_kernels", False))
+
+    if args.deterministic_render:
+        render = True
+    if args.no_deterministic_render:
+        render = False
+    if args.deterministic_kernels:
+        kernels = True
+
+    return {"render": render, "kernels": kernels}
+
+
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--config", required=True)
     parser.add_argument("--seeds")
     parser.add_argument("--check-only", action="store_true")
+    parser.add_argument(
+        "--deterministic-render",
+        action="store_true",
+        help="принудительно включить детерминированный рендер "
+             "(перекрывает rollout.deterministic_render)",
+    )
+    parser.add_argument(
+        "--no-deterministic-render",
+        action="store_true",
+        help="принудительно выключить -- только для воспроизведения "
+             "старых прогонов, сделанных до этой правки",
+    )
+    parser.add_argument(
+        "--deterministic-kernels",
+        action="store_true",
+        help="плюс детерминированные CUDA-ядра: cudnn.deterministic, "
+             "без TF32, use_deterministic_algorithms",
+    )
     args = parser.parse_args()
 
-    cfg = load_yaml(args.config)
+    cfg = load_rollout_config(args.config)
+    determinism = resolve_determinism(cfg, args)
+
+    if determinism["kernels"]:
+        enable_determinism()
+
     if bool(cfg["output"]["video"]["enabled"]):
         ffmpeg_path = imageio_ffmpeg.get_ffmpeg_exe()
         mediapy.set_ffmpeg(ffmpeg_path)
@@ -666,10 +853,19 @@ def main() -> int:
         load_yaml(cfg["configs"]["sim"]),
         cfg["configs"]["randomization"],
     )
+    if determinism["render"]:
+        # После создания EpisodeScene: offsamples читается при создании
+        # GL-контекста, поэтому рендереры пересоздаются внутри.
+        make_render_deterministic(scene)
+
     runner = SmolVLARunner(cfg)
     runner.validate(scene)
 
     print("Configuration, scene and checkpoint are compatible.")
+    print(
+        f"Determinism: render={determinism['render']} "
+        f"kernels={determinism['kernels']}"
+    )
     
     state_feature_key = cfg["observation"]["state"]["feature_key"]
 
@@ -693,16 +889,10 @@ def main() -> int:
         raise ValueError("No evaluation seeds selected")
 
     output_cfg = cfg["output"]
-    output_dir = resolve_path(output_cfg["directory"])
-    output_dir.mkdir(parents=True, exist_ok=True)
+    output_dir = select_output_directory(output_cfg, seeds)
 
     episodes_path = output_dir / output_cfg["episodes_filename"]
     summary_path = output_dir / output_cfg["summary_filename"]
-
-    if episodes_path.exists() and not bool(output_cfg["overwrite"]):
-        raise FileExistsError(
-            f"Output already exists: {episodes_path}"
-        )
 
     records: list[dict[str, Any]] = []
 
@@ -719,7 +909,7 @@ def main() -> int:
             )
             records.append(record)
 
-            stream.write(json.dumps(record) + "\n")
+            stream.write(dumps_strict(record) + "\n")
             stream.flush()
 
             print(
@@ -739,6 +929,7 @@ def main() -> int:
             cfg["task"]["instruction"].split()
         ),
         "seeds": seeds,
+        "determinism": determinism,
         "episodes": len(records),
         "successes": success_count,
         "success_ratio": f"{success_count}/{len(records)}",
@@ -753,12 +944,12 @@ def main() -> int:
     }
 
     summary_path.write_text(
-        json.dumps(summary, indent=2) + "\n",
+        dumps_strict(summary, indent=2) + "\n",
         encoding="utf-8",
     )
 
     print("\nEvaluation complete")
-    print(json.dumps(summary, indent=2))
+    print(dumps_strict(summary, indent=2))
     return 0
 
 

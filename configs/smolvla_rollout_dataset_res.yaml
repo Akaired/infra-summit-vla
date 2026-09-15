@@ -1,5 +1,18 @@
+# ДИАГНОСТИЧЕСКИЙ конфиг (B17): разрешения рендера из датасета.
+#
+# Отличается от configs/smolvla_rollout.yaml РОВНО ДВУМЯ полями:
+#   configs.sim      -> configs/sim_dataset_res.yaml
+#   output.directory -> отдельный каталог
+#
+# Проверяемое предсказание: наклон промаха на высоте захвата по
+# plate_y уйдёт от -0.125 ближе к нулю, и seed 1 (промах 0.0832 при
+# радиусе тарелки 0.089) перевернётся в успех. Если наклон не
+# сдвинется -- остаточный ресэмплинг ни при чём.
+#
+# n_action_steps, grasp assist, критерии успеха и веса НЕ меняются.
+
 configs:
-  sim: configs/sim.yaml
+  sim: configs/sim_dataset_res.yaml
   randomization: configs/randomization.yaml
   grasp_assist: configs/grasp_assist.yaml
 
@@ -158,7 +171,7 @@ evaluation:
 grasp_assist: {}
 
 output:
-  directory: outputs/eval/ckpt-048000-native
+  directory: outputs/eval/ckpt-048000-native-datares
   overwrite: true
   episodes_filename: episodes.jsonl
   summary_filename: summary.json

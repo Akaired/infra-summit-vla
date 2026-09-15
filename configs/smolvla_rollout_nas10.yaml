@@ -1,3 +1,22 @@
+# ДИАГНОСТИЧЕСКИЙ конфиг, Шаг 2: проверка гипотезы об open-loop horizon.
+#
+# Отличается от configs/smolvla_rollout.yaml РОВНО ДВУМЯ полями:
+#   model.n_action_steps : 50 -> 10
+#   output.directory     : отдельный каталог, чтобы не смешивать с baseline
+#
+# Больше не меняется НИЧЕГО: веса, датасет, grasp assist, геометрия сцены,
+# разрешения камер, критерии успеха -- всё то же, что в baseline.
+#
+# Арифметика окна: один policy step = action_repeat(2) * control_decimation(10)
+# * timestep(0.002) = 0.04 с. При n_action_steps=50 модель не видит новых
+# наблюдений 2.0 с; при 10 -- 0.4 с, горизонт короче в 5 раз.
+#
+# Почему 10, а не 1: pred[0] в чанке фактически копирует текущее состояние
+# (измерено chunk-пробой), поэтому при n_action_steps=1 каждая команда
+# превращается в "стой где стоишь" и рука замирает. При 10 на копию состояния
+# уходит 10% команд против 2% при 50 -- приемлемая цена. 10 делит 50 без
+# остатка, границы чанков остаются выровненными.
+
 configs:
   sim: configs/sim.yaml
   randomization: configs/randomization.yaml
@@ -7,7 +26,7 @@ model:
   checkpoint: checkpoints/048000-native-geometry
   device: cuda
   torch_seed_offset: 0
-  n_action_steps: 50
+  n_action_steps: 10
 task:
   instruction: >-
     Open the drawer, close the drawer, pick up the plate, and place the
@@ -158,7 +177,7 @@ evaluation:
 grasp_assist: {}
 
 output:
-  directory: outputs/eval/ckpt-048000-native
+  directory: outputs/eval/ckpt-048000-native-nas10
   overwrite: true
   episodes_filename: episodes.jsonl
   summary_filename: summary.json

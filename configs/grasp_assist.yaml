@@ -34,11 +34,29 @@ plate:
 
   gripper_site: left_gripperframe
   gripper_action_index: 5
-  require_closed_for_activation: false
-  close_threshold: -0.05
-  open_threshold: 0.05
+
+  # Weld fires only on contact AND a commanded close. With `false` it fired
+  # on any contact at any gripper position, so a bump-and-raise counted as a
+  # pick-up -- the chunk probe shows the policy holds 49-50/50 CLOSED through
+  # the whole carry, so the model does not need the concession.
+  require_closed_for_activation: true
+
+  # The action channel is trimodal: -0.16 (closed) / 0.0 (idle, 35% of
+  # training frames) / 1.2 (open). Thresholds sit at the midpoints, not next
+  # to a mode: at open_threshold 0.05 a single noisy sample at +0.06 -- or a
+  # measured intermediate prediction like +0.51 -- read as "open" and
+  # released the plate mid-carry.
+  close_threshold: -0.08
+  open_threshold: 0.6
+
+  # Activation. In demo collection the weld was driven by the script, so
+  # these keys exist only for rollout, where the grasp has to be inferred.
+  activation_mode: contact
+  activation_site: left_gripperframe
+  activation_distance_m: 0.03
 
   minimum_lift_before_release_m: 0.05
   release_site_z_m: 0.85
+  release_open_hold_policy_steps: 2
   release_timeout_policy_steps: 40
   prevent_reactivation_after_release: true

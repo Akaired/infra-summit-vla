@@ -36,6 +36,12 @@ class EpisodeScene:
         self.model = mujoco.MjModel.from_xml_path(str(mjcf_path))
         self.data = mujoco.MjData(self.model)
 
+        # activate/deactivate_grasp_* write into model.eq_active0, and the
+        # model is compiled ONCE and reused for every seed. Snapshot the
+        # compiled defaults so reset() can undo whatever the last episode
+        # left behind.
+        self._initial_eq_active0 = self.model.eq_active0.copy()
+
         self.randomizer = DomainRandomizer(self.model, str(resolve_path(randomization_cfg_path)))
 
         self.control_decimation = int(sim_cfg["physics"]["control_decimation"])
@@ -70,7 +76,12 @@ class EpisodeScene:
     # ------------------------------------------------------------------ #
     def reset(self, seed: int) -> None:
         """Reset to the randomized scene for ``seed`` (already settled)."""
+        # Restore BEFORE the randomizer runs: it places the objects and
+        # settles them, and a weld left active by the previous episode would
+        # otherwise settle the scene with the plate glued to the gripper.
+        self.model.eq_active0[:] = self._initial_eq_active0
         self.randomizer.reset(self.data, seed)
+        self.data.eq_active[:] = self._initial_eq_active0
         mujoco.mj_forward(self.model, self.data)
         self.in_drawer_items = set(self.randomizer.last_in_drawer_items)
 

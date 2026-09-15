@@ -3,12 +3,26 @@
 # compiled MJCF at runtime (model.actuator_ctrlrange), so they can never
 # drift out of sync with the scene file the way a hand-copied number would.
 #
-# policy_action_convention: policy outputs are normalized to [-1, 1] per
-# dimension. sim/env.py maps that linearly onto each actuator's real
-# ctrlrange. All 12 actuators are MuJoCo <position> actuators -- ctrl is a
-# target joint angle/opening, not torque or velocity.
+# All 12 actuators are MuJoCo <position> actuators -- ctrl is a target joint
+# angle/opening, not torque or velocity.
+#
+# ВАЖНО: в проекте ДВЕ конвенции действия, и они не взаимозаменяемы.
+#
+#   1. normalized_minus1_to_1 -- путь sim/env.py. Политика выдаёт [-1, 1]
+#      на размерность, sim/env.py:76-78 линейно разворачивает это на
+#      реальный ctrlrange каждого актуатора.
+#
+#   2. raw_actuator_position -- путь SmolVLA eval. Чекпоинт выдаёт СЫРЫЕ
+#      целевые положения в единицах сустава; eval/scene.py:apply_action
+#      пишет их в data.ctrl, только клипая по ctrlrange, без
+#      денормализации. В трейсах встречаются значения вида 1.2351, что в
+#      нормализованной конвенции невозможно по определению.
+#
+# Пороги GraspAssist (configs/grasp_assist.yaml) заданы во ВТОРОЙ
+# конвенции и валидны только для eval-пути.
 
-policy_action_convention: normalized_minus1_to_1
+policy_action_convention: normalized_minus1_to_1   # путь sim/env.py
+eval_action_convention: raw_actuator_position       # путь SmolVLA eval
 
 actuators:
   - left_shoulder_pan
@@ -26,4 +40,12 @@ actuators:
 
 units:
   joint: radians
-  gripper: meters   # finger slide position, not a normalized open/close scalar
+  # Гриппер -- hinge, не призматический сустав:
+  #   <joint name="left_gripper" range="-0.174533 1.74533"/>
+  # без атрибута type, то есть MuJoCo трактует его как hinge -> РАДИАНЫ.
+  # Было "meters # finger slide position" -- фактическая ошибка. Единица
+  # попадает в метаданные через policy/create_bimanual_v0.py:181
+  # ("action_units"), поэтому неверное значение запекалось в конфиги
+  # создаваемых политик. Шапка MJCF ("5 revolute joints + 1 prismatic
+  # gripper") тоже устарела и к правке не относится.
+  gripper: radians

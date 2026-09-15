@@ -1,3 +1,27 @@
+# ДИАГНОСТИЧЕСКИЙ конфиг (B7): допуски из configs/eval.yaml.
+#
+# Два харнесса объявляют разные пороги для одних и тех же физических
+# величин. configs/eval.yaml описывает УСТАРЕВШУЮ постановку задачи
+# (cutlery / cup / handoff / pour), поэтому авторитетом по задаче он не
+# является и сводить smolvla_rollout к нему «по умолчанию» нельзя.
+#
+# Но его допуски строже, и этот конфиг отвечает на конкретный вопрос:
+# сколько из 8/10 выживает при жёстких допусках. Это важно, потому что
+# два успеха проходят на волоске (перемещение 0.0658 и 0.0645 м).
+#
+# Отличается от baseline тремя значениями, все три взяты из
+# configs/eval.yaml буквально:
+#   lifted_delta_z_m          0.05 -> 0.06   (eval.yaml:81 cutlery_retrieved_lift_m)
+#   surface_z_tolerance_m     0.035 -> 0.02  (eval.yaml:89 on_surface_tolerance_m)
+#   resting_linear_speed_mps  0.08 -> 0.05   (eval.yaml:69 resting_linear_speed_mps)
+#
+# placed_min_xy_displacement_m НЕ меняется: eval.yaml:88 объявляет ровно
+# те же 0.05, расхождения нет.
+#
+# Это стресс-тест метрики, а не эксперимент на атрибуцию: три порога
+# меняются вместе намеренно, потому что вопрос один -- «выживает ли
+# результат при строгом судействе».
+
 configs:
   sim: configs/sim.yaml
   randomization: configs/randomization.yaml
@@ -118,7 +142,7 @@ evaluation:
 
   plate:
     body_name: plate
-    lifted_delta_z_m: 0.05
+    lifted_delta_z_m: 0.06
 
     # plate_placed = тарелку РЕАЛЬНО переместили, вернули на поверхность,
     # она стоит, и weld отпущен. Тот же критерий, что объявлен в
@@ -132,8 +156,8 @@ evaluation:
     # того, куда наводили. Радиус, принимающий всё это, принимает
     # пол-стола.
     placed_min_xy_displacement_m: 0.05
-    surface_z_tolerance_m: 0.035
-    resting_linear_speed_mps: 0.08
+    surface_z_tolerance_m: 0.02
+    resting_linear_speed_mps: 0.05
 
     # ТОЛЬКО для диагностики: eval/diagnose_plate.py считает по ним
     # legacy-критерий рядом с рабочим, чтобы расхождение было видно.
@@ -158,7 +182,7 @@ evaluation:
 grasp_assist: {}
 
 output:
-  directory: outputs/eval/ckpt-048000-native
+  directory: outputs/eval/ckpt-048000-native-strict
   overwrite: true
   episodes_filename: episodes.jsonl
   summary_filename: summary.json

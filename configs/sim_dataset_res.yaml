@@ -1,0 +1,84 @@
+# Копия configs/sim.yaml, отличающаяся ТОЛЬКО разрешениями камер.
+# Всё остальное -- MJCF, физика, робот, объекты -- идентично, чтобы
+# сравнение baseline против этого конфига меняло одну переменную.
+
+# MuJoCo simulation configuration.
+# Owned by: feature/mujoco-scene
+# Consumed by: /sim, and indirectly by /eval (which steps the sim).
+#
+# All paths are relative to the repository root. Nothing in /sim may hardcode
+# a path, a body/joint name, or a camera name -- it comes from here.
+
+scene:
+  mjcf: sim/assets/dinner_table_dual_so101.xml
+  asset_dir: sim/assets
+
+physics:
+  timestep: 0.002            # seconds per mj_step
+  control_decimation: 10     # physics steps applied per policy action
+  gravity: [0.0, 0.0, -9.81]
+
+# Camera names must match the <camera> elements in the MJCF scene.
+# This list defines the observation stream handed to the policy.
+# ДИАГНОСТИЧЕСКИЙ вариант: разрешения из датасета вместо 640x480/320x240.
+#
+# datasets/demo-100/meta/info.json:
+#   observation.images.overhead    240x320
+#   observation.images.wrist_left  120x160
+#   observation.images.wrist_right 120x160
+#
+# collect_demonstrations.py:CAMERA_SPECS рендерил именно эти размеры,
+# а configs/sim.yaml рендерит вдвое крупнее -- расхождение между demo
+# setup и "финальным MuJoCo" существовало до всех правок обвязки.
+# Здесь оно снято: eval рендерит ровно то, что лежит в датасете, и
+# eval/eval_smolvla.py:_image_tensor становится полным no-op.
+cameras:
+  - name: overhead
+    width: 320
+    height: 240
+  - name: wrist_left
+    width: 160
+    height: 120
+  - name: wrist_right
+    width: 160
+    height: 120
+
+robot:
+  # Name prefixes used to resolve joints/actuators per arm in the MJCF.
+  left_arm_prefix: left_
+  right_arm_prefix: right_
+  # Measured gravity-equilibrium pose (not a guess) -- see
+  # randomization.py DomainRandomizer._compute_robot_equilibrium_pose.
+  # Recomputed for the real SO-101 (TheRobotStudio/SO-ARM100) after the
+  # placeholder-rig swap. Much smaller sag than the placeholder showed --
+  # the real STS3215 servo model uses kp=998 (vs. the placeholder's kp=15),
+  # so gravity droop is naturally far smaller. Order matches
+  # action_space.yaml `actuators`.
+  home_qpos:
+    left_shoulder_pan: 0.00000
+    left_shoulder_lift: 0.00062
+    left_elbow_flex: 0.00053
+    left_wrist_flex: 0.00014
+    left_wrist_roll: 0.00002
+    left_gripper: -0.00000
+    right_shoulder_pan: 0.00000
+    right_shoulder_lift: 0.00062
+    right_elbow_flex: 0.00053
+    right_wrist_flex: 0.00014
+    right_wrist_roll: 0.00002
+    right_gripper: -0.00000
+
+# Objects the dinner-table task manipulates. Names must match MJCF bodies.
+objects:
+  drawer: drawer
+  plate: plate
+  cup: cup
+  bottle: bottle
+  cutlery:
+    - spoon_1
+    - fork_1
+
+
+viewer:
+  enabled: false             # MuJoCo native viewer; off for headless eval runs
+  offscreen_renderer: true
