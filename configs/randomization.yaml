@@ -42,21 +42,15 @@ placement:
   settle_max_steps: 500
   settle_velocity_threshold: 0.01
 
-  # Cutlery-only, soft constraint (for cutlery placed ON THE TABLE -- see
-  # drawer_interior below for cutlery placed INSIDE the closed drawer
-  # instead). NOT a physical collision: the drawer body sits entirely below
-  # the tabletop surface objects rest on, so there is no real 3D overlap
-  # possible between table-top cutlery and the drawer regardless of XY
-  # position. This exists purely to keep cutlery out of the drawer's
-  # overhead opening path -- an arm reaching down to open the drawer
-  # shouldn't have to route around a randomly-placed spoon.
-  # Values match the drawer's current geometry: closed center y=0.27,
-  # half-extent-y=0.08 (see the drawer body comment in the MJCF for the
-  # full redesign rationale -- this replaces the old center=0.32/half=0.09
-  # which put the closed drawer 6cm past the table edge).
+  # Hard clearance rule for EVERY table object. The drawer opens toward -Y,
+  # so the boundary includes its complete 16 cm travel, its own front
+  # half-extent, and a safety margin. Cutlery intentionally placed inside
+  # the closed drawer by drawer_interior is handled separately.
+  # Values come directly from dinner_table_dual_so101.xml.
   drawer_avoidance:
-    drawer_y_center_m: 0.27
-    drawer_half_extent_y_m: 0.08
+    drawer_y_center_closed_m: 0.24
+    drawer_half_extent_y_m: 0.075
+    drawer_open_travel_m: 0.16
     extra_margin_m: 0.03
 
   # Cutlery can spawn INSIDE the closed drawer instead of on the table --
@@ -70,7 +64,7 @@ placement:
   #
   # Cavity interior (from the MJCF's drawer_floor/walls): half-extent
   # (0.114, 0.074) at local z=-0.037 (floor) up to z=0.04 (rim), in the
-  # DRAWER's own closed-position world frame (drawer center y=0.27).
+  # DRAWER's own closed-position world frame (drawer center y=0.24).
   # yaw is constrained near +/-90deg (not the full range used on the table)
   # because the cavity's long axis is X (0.114) vs a short Y (0.074) --
   # cutlery has to lie roughly parallel to the drawer's width to fit with
@@ -89,7 +83,7 @@ placement:
     # even spacing, not by independent random placement + fallback search.
     # Capping at 2 keeps placement comfortably, reliably solvable.
     max_items_in_drawer: 2
-    world_y_center_closed_m: 0.27
+    world_y_center_closed_m: 0.24
     cavity_x: [-0.043, 0.043]
     cavity_y: [-0.054, 0.054]
     cavity_yaw: [1.4208, 1.7208]   # ~90deg +/- 0.15 rad, aligns long axis with cavity's X

@@ -1,0 +1,748 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<title>Vino &amp; Dine — Live Demo</title>
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<style>
+  :root {
+    --bg: #0b0d12;
+    --panel: #12151c;
+    --panel-2: #181c25;
+    --border: #262b36;
+    --text: #e7e9ee;
+    --muted: #8b93a3;
+    --accent: #7dd3a8;
+    --accent-2: #e0b04a;
+    --danger: #e06a6a;
+  }
+  * { box-sizing: border-box; }
+  html, body {
+    margin: 0; padding: 0; height: 100%;
+    background: var(--bg); color: var(--text);
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Inter, sans-serif;
+  }
+  #app {
+    display: grid;
+    grid-template-columns: 1fr 340px;
+    grid-template-rows: 56px 1fr;
+    height: 100vh;
+  }
+  header {
+    grid-column: 1 / 3;
+    display: flex; align-items: center; gap: 12px;
+    padding: 0 16px;
+    background: var(--panel);
+    border-bottom: 1px solid var(--border);
+  }
+  header h1 { font-size: 15px; font-weight: 600; margin: 0; }
+  #status-dot {
+    width: 9px; height: 9px; border-radius: 50%;
+    background: var(--danger);
+    box-shadow: 0 0 6px var(--danger);
+  }
+  #status-dot.connected { background: var(--accent); box-shadow: 0 0 6px var(--accent); }
+  #viewport { position: relative; background: #05070a; }
+  #viewport canvas { display: block; }
+  #viewport-overlay {
+    position: absolute; top: 12px; left: 12px;
+    font-size: 11px; color: var(--muted);
+    background: rgba(10,12,16,0.6); padding: 6px 10px; border-radius: 6px;
+    pointer-events: none;
+  }
+  #sidebar {
+    display: flex; flex-direction: column;
+    background: var(--panel);
+    border-left: 1px solid var(--border);
+    overflow: hidden;
+  }
+  #seed-row {
+    display: flex; align-items: center; gap: 8px;
+    padding: 12px 14px; border-bottom: 1px solid var(--border);
+  }
+  #seed-row label { font-size: 12px; color: var(--muted); }
+  select, button, input[type=text] {
+    background: var(--panel-2); color: var(--text);
+    border: 1px solid var(--border); border-radius: 6px;
+    padding: 6px 8px; font-size: 13px;
+  }
+  button { cursor: pointer; }
+  button:hover { border-color: var(--accent); }
+  button.primary { background: var(--accent); color: #06110b; border-color: var(--accent); font-weight: 600; }
+  button.stop { border-color: var(--danger); color: var(--danger); background: transparent; }
+  #subtasks { padding: 12px 14px; border-bottom: 1px solid var(--border); }
+  #subtasks h2, #log h2 { font-size: 11px; text-transform: uppercase; letter-spacing: .06em; color: var(--muted); margin: 0 0 8px; }
+  .subtask-row { display: flex; align-items: center; gap: 8px; font-size: 12.5px; padding: 3px 0; }
+  .badge { width: 8px; height: 8px; border-radius: 50%; flex: none; }
+  .badge.completed { background: var(--accent); }
+  .badge.incomplete { background: #3a4050; }
+  .badge.not_implemented { background: #4a4030; }
+  .subtask-name { flex: 1; }
+  .subtask-status { color: var(--muted); font-size: 10.5px; text-transform: uppercase; }
+  #log {
+    flex: 1; display: flex; flex-direction: column; min-height: 0;
+    padding: 12px 14px;
+  }
+  #log-lines {
+    flex: 1; overflow-y: auto; font-size: 12px; color: var(--muted);
+    display: flex; flex-direction: column-reverse; gap: 4px;
+  }
+  #log-lines .line { color: var(--text); }
+  #log-lines .line.you { color: var(--accent-2); }
+  #log-lines .line.err { color: var(--danger); }
+  #chat-row {
+    display: flex; gap: 6px; padding: 12px 14px; border-top: 1px solid var(--border);
+  }
+  #chat-input { flex: 1; }
+</style>
+</head>
+<body>
+<div id="app">
+  <header>
+    <div id="status-dot"></div>
+    <h1>Vino &amp; Dine — Bimanual VLA</h1>
+  </header>
+
+  <div id="viewport">
+    <div id="viewport-overlay">seed: <span id="ov-seed">–</span> · step: <span id="ov-step">0</span></div>
+  </div>
+
+  <div id="sidebar">
+    <div id="seed-row">
+      <label for="seed-select">Seed</label>
+      <select id="seed-select"></select>
+      <button id="reset-btn">Reset</button>
+    </div>
+
+    <div id="subtasks">
+      <h2>Subtasks</h2>
+      <div id="subtask-list"><span class="sub" style="color:var(--muted)">waiting for scene…</span></div>
+    </div>
+
+    <div id="log">
+      <h2>Command log</h2>
+      <div id="log-lines"></div>
+    </div>
+
+    <div id="chat-row">
+      <input id="chat-input" type="text" placeholder="e.g. open the top drawer" />
+      <button id="send-btn" class="primary">Send</button>
+      <button id="stop-btn" class="stop">Stop</button>
+    </div>
+
+  </div>
+</div>
+
+<script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/three@0.128.0/examples/js/controls/OrbitControls.js"></script>
+<script>
+// ---------------------------------------------------------------------------
+// Arm rig: drawn from the compiled MJCF's OWN geometry (GET /api/info's
+// arm_rig -- server.py's describe_arm_rig()), not a separately-loaded URDF.
+//
+// This used to load TheRobotStudio/SO-ARM100's URDF+STL rig via urdf-loader
+// and just place it (by base offset only) wherever the sim's arm base sat --
+// a reasonable stand-in back when sim/assets/dinner_table_dual_so101.xml's
+// own arm bodies were placeholder capsules with no real shape. That's no
+// longer true: the MJCF now carries the real SO-101 meshes itself, so a
+// second, independently-scaled/proportioned skeleton drawn on top produced
+// an arm rendered at the wrong size relative to the table (the URDF's own
+// link lengths, not the sim's). Reading the rig straight from the same
+// compiled model the physics uses removes that whole class of mismatch by
+// construction -- same as every other body in this scene.
+// ---------------------------------------------------------------------------
+
+// ---------------------------------------------------------------------------
+// MuJoCo (z-up, right-handed: x,y,z) -> three.js (y-up, right-handed) frame
+// conversion, used everywhere a position/quaternion crosses from the sim to
+// the viewer. This MUST be a real rotation (determinant +1), not a bare
+// axis swap: three=(x, z, y) swaps two axes, which has determinant -1 --
+// that's a mirror reflection, not a rotation. A mirror is harmless for
+// pure positions (translation doesn't care about handedness) but WRONG for
+// every rotated thing in this scene (mesh faces, joint orientations, box
+// rotations) -- it silently flips winding/orientation, which is exactly
+// the kind of "everything is subtly misplaced/backwards" bug a screenshot
+// review catches but the position numbers alone don't. The correct
+// conversion is a genuine -90 degree rotation about X: three=(x, z, -y).
+// ---------------------------------------------------------------------------
+function mjPosToThree(p) {
+  return new THREE.Vector3(p[0], p[2], -p[1]);
+}
+function mjQuatToThree(q) {
+  // q is MuJoCo wxyz. Conjugating by the same -90-about-X change of basis:
+  // (w, x, y, z) -> (w, x, z, -y) in three's (x,y,z,w) constructor order.
+  return new THREE.Quaternion(q[1], q[3], -q[2], q[0]);
+}
+
+const viewport = document.getElementById('viewport');
+const scene3d = new THREE.Scene();
+scene3d.background = new THREE.Color(0x05070a);
+
+const camera = new THREE.PerspectiveCamera(45, 1, 0.01, 50);
+// Sim frame is z-up (table top at z=0.75); viewer is y-up (mujocoToThree
+// remaps z,y -> y,z everywhere below), so this is that same point remapped:
+// looking at the table surface from an angled, slightly-above vantage.
+camera.position.set(1.1, 1.1, 0.9);
+camera.lookAt(0, 0.75, 0);
+
+const renderer = new THREE.WebGLRenderer({ antialias: true });
+viewport.appendChild(renderer.domElement);
+
+// Drag to orbit, scroll to zoom, right-drag/two-finger to pan -- without
+// this the camera was completely fixed, which made it impossible to look
+// around the scene at all.
+const controls = new THREE.OrbitControls(camera, renderer.domElement);
+controls.target.set(0, 0.75, 0);
+controls.enableDamping = true;
+controls.dampingFactor = 0.08;
+controls.update();
+
+function resizeRenderer() {
+  const w = viewport.clientWidth, h = viewport.clientHeight;
+  renderer.setSize(w, h);
+  camera.aspect = w / h;
+  camera.updateProjectionMatrix();
+}
+window.addEventListener('resize', resizeRenderer);
+
+scene3d.add(new THREE.AmbientLight(0xffffff, 0.6));
+const dirLight = new THREE.DirectionalLight(0xffffff, 0.8);
+dirLight.position.set(1, 2, 1);
+scene3d.add(dirLight);
+
+const grid = new THREE.GridHelper(2, 20, 0x2a2f3a, 0x1a1e26);
+grid.position.y = -0.001;
+scene3d.add(grid);
+
+// ---------------------------------------------------------------------------
+// Static scene (table, drawer shell, room) -- built from GET /api/info's
+// static_scene, which reads the actual compiled MJCF geoms
+// (sim/assets/dinner_table_dual_so101.xml) rather than guessing a slab.
+// Every body in static_scene becomes one THREE.Group holding one mesh per
+// MuJoCo geom, positioned/rotated exactly as MuJoCo compiled them. A body
+// with a slide/hinge joint (currently just "drawer") is kept in
+// jointedBodies so live WS "objects" position updates can move the whole
+// group, not just redraw a single primitive.
+// ---------------------------------------------------------------------------
+
+const MJ_TYPE_TO_THREE = { box: 'box', sphere: 'sphere', cylinder: 'cylinder', capsule: 'capsule', plane: 'plane' };
+const jointedBodies = {}; // body name -> THREE.Group, for bodies with a joint (e.g. drawer)
+
+// MuJoCo's cylinder/capsule long axis is local Z. Our MuJoCo -> three.js
+// basis conversion maps that Z axis to three.js local Y, which is already
+// the native long axis of CylinderGeometry/CapsuleGeometry. Applying an
+// additional 90-degree rotation here used to lay the bottle and the
+// drawer's vertical handle on their sides.
+
+function meshFromStaticGeom(g) {
+  const kind = MJ_TYPE_TO_THREE[g.type];
+  let geom;
+  const [sx, sy, sz] = g.size;
+  if (kind === 'box') geom = new THREE.BoxGeometry(sx * 2, sz * 2, sy * 2); // mj half-extents, z/y swapped for y-up
+  else if (kind === 'sphere') geom = new THREE.SphereGeometry(sx, 16, 16);
+  else if (kind === 'cylinder') geom = new THREE.CylinderGeometry(sx, sx, sy * 2, 20);
+  else if (kind === 'capsule' && THREE.CapsuleGeometry) geom = new THREE.CapsuleGeometry(sx, sy * 2, 4, 12);
+  else if (kind === 'capsule') geom = new THREE.CylinderGeometry(sx, sx, sy * 2, 12); // r128 has no CapsuleGeometry
+  else if (kind === 'plane') geom = new THREE.PlaneGeometry((sx || 4) * 2, (sy || 4) * 2);
+  else return null;
+
+  const [r, gc, b, a] = g.rgba && g.rgba.length === 4 ? g.rgba : [0.6, 0.6, 0.6, 1];
+  const mesh = new THREE.Mesh(geom, new THREE.MeshStandardMaterial({
+    color: new THREE.Color(r, gc, b), transparent: a < 1, opacity: a, roughness: 0.8,
+  }));
+  mesh.position.copy(mjPosToThree(g.pos));
+  mesh.quaternion.copy(mjQuatToThree(g.quat));
+  if (kind === 'plane') mesh.quaternion.multiply(new THREE.Quaternion().setFromAxisAngle(new THREE.Vector3(1, 0, 0), -Math.PI / 2));
+  return mesh;
+}
+
+function buildStaticScene(staticScene) {
+  const bodies = staticScene?.bodies || {};
+  for (const [bodyName, body] of Object.entries(bodies)) {
+    const group = new THREE.Group();
+    group.position.copy(mjPosToThree(body.body_pos));
+    for (const g of body.geoms) {
+      const mesh = meshFromStaticGeom(g);
+      if (mesh) group.add(mesh);
+    }
+    scene3d.add(group);
+    if (body.joint) {
+      // Store the body's own base offset once; live position updates below
+      // (from WS "objects", which already includes "drawer") replace this
+      // group's position outright each tick with the current sim-frame
+      // world position, so no separate joint-value math is needed here.
+      jointedBodies[bodyName] = group;
+    }
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Table objects. Anything with a real visual mesh (GET /api/info's
+// object_meshes -- plate/cup/spoon/fork, read straight from the compiled
+// MJCF's own mesh_vert/mesh_face/mesh_texcoord arrays, see server.py's
+// describe_object_meshes()) is drawn as that actual mesh, textured from its
+// real texture_map.png when one is mapped. Objects built from MuJoCo
+// primitives (currently the bottle) come from object_primitives instead.
+// ---------------------------------------------------------------------------
+
+const objectMeshes = {}; // body name -> THREE.Object3D from compiled MJCF data
+const textureLoader = new THREE.TextureLoader();
+
+function rotateVecByMjQuat(v, q) {
+  // Standard quaternion-rotate-vector (Rodrigues), q as [w,x,y,z]:
+  // v' = v + 2*w*(qv x v) + 2*(qv x (qv x v)), qv = (x,y,z)
+  const [w, x, y, z] = q;
+  const qv = [x, y, z];
+  const cross1 = [
+    qv[1] * v[2] - qv[2] * v[1],
+    qv[2] * v[0] - qv[0] * v[2],
+    qv[0] * v[1] - qv[1] * v[0],
+  ];
+  const t = [cross1[0] * 2 * w, cross1[1] * 2 * w, cross1[2] * 2 * w];
+  const cross2 = [
+    qv[1] * cross1[2] - qv[2] * cross1[1],
+    qv[2] * cross1[0] - qv[0] * cross1[2],
+    qv[0] * cross1[1] - qv[1] * cross1[0],
+  ];
+  return [
+    v[0] + t[0] + 2 * cross2[0],
+    v[1] + t[1] + 2 * cross2[1],
+    v[2] + t[2] + 2 * cross2[2],
+  ];
+}
+
+// Shared by table-object meshes (buildObjectMesh) and arm-link meshes
+// (buildArmRig): turns a MuJoCo mesh geom (raw local vertices/faces + that
+// geom's own geom_pos/geom_quat, body-relative) into a three.js
+// BufferGeometry already expressed in the OWNING BODY's local frame, in
+// three's axis convention. Baking geom_pos/geom_quat in here (rather than
+// keeping them as a live transform) mirrors describe_object_meshes()'s own
+// frame chain: world = body_xform * geom_xform * mesh_vert, and only
+// body_xform changes at runtime (the body's own position/quaternion, set by
+// the caller on whatever Object3D holds this geometry).
+function geometryFromMeshGeom(vertices, faces, geomPos, geomQuat) {
+  const geometry = new THREE.BufferGeometry();
+  const verts = new Float32Array(vertices.flat());
+  geometry.setAttribute('position', new THREE.BufferAttribute(verts, 3));
+  geometry.setIndex(faces.flat());
+
+  const posAttr = geometry.getAttribute('position');
+  for (let i = 0; i < posAttr.count; i++) {
+    let v = [posAttr.getX(i), posAttr.getY(i), posAttr.getZ(i)];
+    v = rotateVecByMjQuat(v, geomQuat);
+    v = [v[0] + geomPos[0], v[1] + geomPos[1], v[2] + geomPos[2]];
+    // mj frame -> three's frame, exactly once, last -- same remap as every
+    // other position in this file (mjPosToThree), applied per-vertex here
+    // since geometry itself (not a single transform node) needs converting.
+    const p = mjPosToThree(v);
+    posAttr.setXYZ(i, p.x, p.y, p.z);
+  }
+  posAttr.needsUpdate = true;
+  geometry.computeVertexNormals();
+  return geometry;
+}
+
+function buildObjectMesh(name, meshData) {
+  // MuJoCo's own compiled-mesh frame chain (server.py's describe_object_meshes
+  // docstring): world = body_xform * geom_xform * mesh_xform * mesh_vert.
+  // body_xform is applied at runtime (position/quaternion on the returned
+  // Object3D, updated every WS tick from live "objects" pos+quat); geom_xform
+  // and mesh_xform are both fixed for the object's lifetime, so they're baked
+  // once into the BufferGeometry here rather than kept as extra live nodes.
+  const geometry = geometryFromMeshGeom(meshData.vertices, meshData.faces, meshData.geom_pos, meshData.geom_quat);
+  const verts = geometry.getAttribute('position').array;
+  if (meshData.texcoords && meshData.face_texcoords) {
+    // mesh_face and mesh_facetexcoord can index vertices/uvs independently;
+    // rebuild a per-vertex UV array aligned to the position buffer by
+    // scattering each face's texcoord triplet onto that face's vertex
+    // indices (a vertex shared by faces with consistent UVs is written
+    // redundantly but consistently -- fine for a static prop mesh).
+    const uv = new Float32Array((verts.length / 3) * 2);
+    const faces = meshData.faces;
+    const faceUvs = meshData.face_texcoords;
+    const src = meshData.texcoords;
+    for (let f = 0; f < faces.length; f++) {
+      for (let k = 0; k < 3; k++) {
+        const vi = faces[f][k];
+        const ti = faceUvs[f][k];
+        uv[vi * 2] = src[ti][0];
+        uv[vi * 2 + 1] = 1 - src[ti][1]; // MuJoCo/OBJ v is bottom-up; three's is top-down
+      }
+    }
+    geometry.setAttribute('uv', new THREE.BufferAttribute(uv, 2));
+  } else if (meshData.texcoords) {
+    // No independent face-texcoord indexing available (older MuJoCo): the
+    // mesh_face indices double as texcoord indices directly.
+    const uv = new Float32Array((verts.length / 3) * 2);
+    for (let i = 0; i < meshData.texcoords.length; i++) {
+      uv[i * 2] = meshData.texcoords[i][0];
+      uv[i * 2 + 1] = 1 - meshData.texcoords[i][1];
+    }
+    geometry.setAttribute('uv', new THREE.BufferAttribute(uv, 2));
+  }
+
+  const materialOpts = { color: 0xffffff, roughness: 0.75 };
+  if (meshData.texture) materialOpts.map = textureLoader.load(meshData.texture);
+  if (!meshData.texture && meshData.rgba) {
+    const [r, g, b] = meshData.rgba;
+    materialOpts.color = new THREE.Color(r, g, b);
+  }
+  const mesh = new THREE.Mesh(geometry, new THREE.MeshStandardMaterial(materialOpts));
+  scene3d.add(mesh);
+  return mesh;
+}
+
+// A tracked object with no mesh geom at all (e.g. "bottle": several MuJoCo
+// primitives -- body/shoulder/neck/lip cylinders -- on one body) is drawn
+// as a Group of real primitives, same shapes/sizes/colors as the compiled
+// model (GET /api/info's object_primitives, server.py's
+// describe_primitive_objects()), reusing meshFromStaticGeom's own
+// primitive-building code (already correct for box/sphere/cylinder/capsule
+// in this file's mj->three conventions) -- NOT a single guessed shape.
+function buildPrimitiveObjectMesh(name, primitiveData) {
+  const group = new THREE.Group();
+  for (const g of primitiveData.geoms) {
+    const mesh = meshFromStaticGeom(g);
+    if (mesh) group.add(mesh);
+  }
+  scene3d.add(group);
+  return group;
+}
+
+function buildObjectMeshes(objectMeshData) {
+  for (const [name, meshData] of Object.entries(objectMeshData || {})) {
+    objectMeshes[name] = buildObjectMesh(name, meshData);
+  }
+}
+
+function buildObjectPrimitives(objectPrimitiveData) {
+  for (const [name, primitiveData] of Object.entries(objectPrimitiveData || {})) {
+    if (objectMeshes[name]) continue; // object_meshes already covered this name; never draw both
+    objectMeshes[name] = buildPrimitiveObjectMesh(name, primitiveData);
+  }
+}
+
+function meshForObject(name) {
+  if (objectMeshes[name]) return objectMeshes[name];
+  throw new Error(`No compiled viewer geometry received for tracked object ${name}`);
+}
+
+// ---------------------------------------------------------------------------
+// Arm rig, built from the compiled MJCF's own kinematic chain (GET
+// /api/info -> arm_rig, server.py's describe_arm_rig()) -- same source of
+// truth as every other body in this scene, not a second imported skeleton.
+//
+// Per arm: a chain of THREE.Group, one per body (base -> shoulder ->
+// upper_arm -> lower_arm -> wrist -> gripper -> ...), each parented under
+// the previous one exactly as MuJoCo's own body tree has it (arm_rig.links'
+// parent_body), each positioned at that body's own body_pos (already
+// body-relative, i.e. parent-local, in MuJoCo -- so parenting the three.js
+// groups the same way means no extra offset math is needed here). Each
+// group holds a Mesh built from that body's own real geoms (mesh geometry
+// baked into body-local space by geometryFromMeshGeom, exactly like table
+// objects). Only the joint groups' own rotation changes at runtime
+// (applyRobotState, driven by live robot_state) -- everything here else is
+// built once from a single /api/info fetch.
+//
+// Note: describe_arm_rig() only reports bodies driven by an ACTUATED joint
+// (see its own docstring -- gripper fingers on an equality constraint are
+// deliberately skipped). This rig's wrist-camera-mount/wrist-camera bodies
+// are fixed (no joint of their own), so they're absent from arm_rig.links
+// and simply aren't drawn -- a minor cosmetic gap (no camera-housing mesh
+// on the wrist), not a kinematic or scale problem.
+// ---------------------------------------------------------------------------
+
+const armJointGroups = {}; // 'left'|'right' -> [{ group, axis: [x,y,z] }, ...] in actuator order
+let armsReady = false;
+
+function armGeomMaterial(g) {
+  const [r, gc, b, a] = g.rgba && g.rgba.length === 4 ? g.rgba : [1, 0.82, 0.12, 1];
+  return new THREE.MeshStandardMaterial({
+    color: new THREE.Color(r, gc, b),
+    transparent: a < 1,
+    opacity: a,
+    metalness: 0.15,
+    roughness: 0.65,
+  });
+}
+
+function meshesFromGeoms(geoms) {
+  // A body can carry more than one real mesh geom (e.g. a motor-holder
+  // piece plus the link shell) -- one three.js Mesh per geom, all parented
+  // under the same body group so they move together.
+  const meshes = [];
+  for (const g of geoms) {
+    if (g.type !== 'mesh' || !g.vertices || !g.faces) continue; // primitive-only body: no visual (rare in this rig)
+    const geometry = geometryFromMeshGeom(g.vertices, g.faces, g.pos, g.quat);
+    meshes.push(new THREE.Mesh(geometry, armGeomMaterial(g)));
+  }
+  return meshes;
+}
+
+function buildArmRig(rig) {
+  const bases = rig?.bases || {};
+  const linksByBody = {}; // body_name -> link descriptor, for parent lookup while walking
+  for (const link of rig?.links || []) linksByBody[link.body_name] = link;
+
+  for (const [side, baseKey] of [['left', 'left_arm_base'], ['right', 'right_arm_base']]) {
+    const base = bases[baseKey];
+    if (!base) continue; // this arm's base body wasn't found server-side; skip rather than guess a placement
+
+    const baseGroup = new THREE.Group();
+    baseGroup.position.copy(mjPosToThree(base.body_pos));
+    // Base body's own rest rotation relative to world (e.g. left_base's
+    // real quat="0.707 0 0 -0.707" in the MJCF) -- previously never
+    // applied, only body_pos was, which is only correct for an unrotated
+    // parent-child chain. This rig's bodies ARE rotated relative to their
+    // parents, so skipping this folded/collapsed the whole arm instead of
+    // letting it extend outward like the MuJoCo-native reference.
+    if (base.body_quat) baseGroup.quaternion.copy(mjQuatToThree(base.body_quat));
+    for (const m of meshesFromGeoms(base.geoms)) baseGroup.add(m);
+    scene3d.add(baseGroup);
+
+    // Walk each link once, parenting it under whichever group its
+    // parent_body already produced -- links arrive in actuator order, which
+    // for this rig's own kinematic chain is always parent-before-child, so
+    // a single forward pass (no multi-pass/topo-sort) is enough. The base
+    // body's own name (e.g. "left_base") is whatever the MJCF author called
+    // it -- arm_rig.bases only gives body_pos/geoms, not that name -- so
+    // groupByBody starts empty and the "parent not found yet" case just
+    // below falls back to baseGroup, which is correct for every link whose
+    // real parent IS the base (guaranteed true for the first link in the
+    // chain, and harmlessly reused as a fallback for any other legitimately
+    // unresolved parent).
+    const groupByBody = {};
+    const armJoints = [];
+    for (const link of rig?.links || []) {
+      if (!link.joint_name.startsWith(side === 'left' ? 'left_' : 'right_')) continue;
+      let parentGroup = groupByBody[link.parent_body];
+      if (!parentGroup) {
+        // Parent is this arm's base body (whatever it's actually named) --
+        // true for the first link in the chain.
+        parentGroup = baseGroup;
+      }
+      const jointGroup = new THREE.Group();
+      jointGroup.position.copy(mjPosToThree(link.body_pos));
+      // Rest rotation relative to the parent body -- same fix as baseGroup
+      // above, and required here for the SAME reason: without it, every
+      // link in the chain sits with its parent's axes instead of its own,
+      // which is the concrete bug behind the arms rendering
+      // clustered/folded near the drawer instead of extended naturally.
+      // Stored separately (restQuat) rather than left as the group's only
+      // quaternion, because applyRobotState below must compose the joint's
+      // own rotation ON TOP of this rest orientation each tick, not
+      // replace it.
+      const restQuat = link.body_quat ? mjQuatToThree(link.body_quat) : new THREE.Quaternion();
+      jointGroup.quaternion.copy(restQuat);
+      for (const m of meshesFromGeoms(link.geoms)) jointGroup.add(m);
+      parentGroup.add(jointGroup);
+      groupByBody[link.body_name] = jointGroup;
+      armJoints.push({ group: jointGroup, restQuat, axis: link.axis, actuatorIndex: link.actuator_index });
+    }
+    armJoints.sort((a, b) => a.actuatorIndex - b.actuatorIndex);
+    armJointGroups[side] = armJoints;
+  }
+  armsReady = true;
+}
+
+function applyRobotState(robotState) {
+  // robot_state = [actuated qpos...] then [actuated qvel...] (eval/scene.py
+  // EpisodeScene.robot_state), actuator order: this rig's convention is
+  // left arm's 6 values first, then right arm's 6 (see configs/sim.yaml
+  // robot.left_arm_prefix / right_arm_prefix and smolvla_rollout.yaml's
+  // actuator_names ordering). Only the qpos half (first 12) is used.
+  //
+  // Each joint group's rotation is set directly from the live qpos value
+  // around that joint's own axis (both already in MuJoCo's frame/units --
+  // radians for a hinge, meters for a slide) -- this IS the body's rotation
+  // relative to its parent, the same quantity MuJoCo itself uses, so no
+  // separate forward-kinematics pass is needed: three.js's own scene graph
+  // (each joint group nested under its parent, built in buildArmRig) does
+  // the composition automatically when it renders.
+  if (!robotState || !armsReady) return;
+  for (const side of ['left', 'right']) {
+    for (const { group, restQuat, axis, actuatorIndex } of armJointGroups[side] || []) {
+      const value = robotState[actuatorIndex];
+      if (typeof value !== 'number' || !Number.isFinite(value)) continue;
+      // axis is in MuJoCo's frame; three's Y and MuJoCo's Z swap under
+      // mjPosToThree's -90-about-X remap, and X stays X while Y picks up a
+      // sign flip -- apply the joint's own axis-angle rotation directly in
+      // three's frame using that same remapped axis, so a mj-frame hinge
+      // about e.g. [0,0,1] (mj Z) becomes three's Y exactly as every other
+      // rotated quantity in this file is remapped.
+      const threeAxis = new THREE.Vector3(axis[0], axis[2], -axis[1]);
+      const jointRot = new THREE.Quaternion().setFromAxisAngle(threeAxis, value);
+      // Compose ON TOP OF the body's own rest orientation (restQuat, from
+      // body_quat), never replace it -- this group's rest rotation places
+      // its local frame (and therefore its axis convention) correctly
+      // under its parent; overwriting the quaternion each tick (the old
+      // code) silently discarded that placement and is the same
+      // missing-body_quat bug as buildArmRig's rest-pose fix above, just
+      // showing up in the animated pose instead of the static one.
+      group.quaternion.copy(restQuat).multiply(jointRot);
+    }
+  }
+}
+
+function animate() {
+  requestAnimationFrame(animate);
+  controls.update(); // required each frame for damping to take effect
+  renderer.render(scene3d, camera);
+}
+resizeRenderer();
+animate();
+
+// ---------------------------------------------------------------------------
+// WebSocket wiring
+// ---------------------------------------------------------------------------
+
+const statusDot = document.getElementById('status-dot');
+const seedSelect = document.getElementById('seed-select');
+const resetBtn = document.getElementById('reset-btn');
+const subtaskList = document.getElementById('subtask-list');
+const logLines = document.getElementById('log-lines');
+const chatInput = document.getElementById('chat-input');
+const sendBtn = document.getElementById('send-btn');
+const stopBtn = document.getElementById('stop-btn');
+const ovSeed = document.getElementById('ov-seed');
+const ovStep = document.getElementById('ov-step');
+
+function logLine(text, cls) {
+  const div = document.createElement('div');
+  div.className = 'line' + (cls ? ' ' + cls : '');
+  div.textContent = text;
+  logLines.prepend(div);
+  while (logLines.childElementCount > 200) logLines.removeChild(logLines.lastChild);
+}
+
+let ws;
+let currentSeed = 0;
+
+// The WebSocket connects and can receive its first "state" message (sent
+// immediately on accept, see server.py's ws_endpoint) in parallel with
+// loadInfo()'s fetch()+scene-build work below -- there is no ordering
+// guarantee between them. Without this gate, an early state message hit
+// meshForObject() for a body whose real mesh hadn't been built yet, which
+// silently built a throwaway primitive fallback for it (never removed once
+// the real mesh arrived later), and objects with no fallback path (the
+// buildObjectMeshes()-only ones like "plate"/"cup") just... never got their
+// first position/rotation applied at all, staying at three's origin
+// (0,0,0) with identity rotation until happened to be repositioned by a
+// later tick. Buffer the most recent message instead, and replay it once
+// the scene is actually ready to receive it.
+let sceneReady = false;
+let pendingState = null;
+
+function connect() {
+  const proto = location.protocol === 'https:' ? 'wss' : 'ws';
+  ws = new WebSocket(`${proto}://${location.host}/ws`);
+
+  ws.onopen = () => { statusDot.classList.add('connected'); logLine('connected'); };
+  ws.onclose = () => {
+    statusDot.classList.remove('connected');
+    logLine('disconnected — retrying in 2s', 'err');
+    setTimeout(connect, 2000);
+  };
+  ws.onerror = () => {};
+  ws.onmessage = (event) => {
+    let msg;
+    try { msg = JSON.parse(event.data); } catch { return; }
+    if (msg.type === 'error') { logLine('error: ' + msg.message, 'err'); return; }
+    if (msg.type === 'state') {
+      if (!sceneReady) { pendingState = msg; return; }
+      applyState(msg);
+    }
+  };
+}
+
+function markSceneReady() {
+  sceneReady = true;
+  if (pendingState) { applyState(pendingState); pendingState = null; }
+}
+
+function applyState(msg) {
+  if (typeof msg.seed === 'number') { currentSeed = msg.seed; ovSeed.textContent = msg.seed; }
+  ovStep.textContent = msg.policy_steps ?? 0;
+
+  if (msg.objects) {
+    for (const [name, state] of Object.entries(msg.objects)) {
+      // "drawer" is a real jointed body already drawn by buildStaticScene()
+      // (floor+walls+handle group) -- move that group's whole shell, don't
+      // draw a second generic primitive on top of it.
+      const target = jointedBodies[name] || meshForObject(name);
+      target.position.copy(mjPosToThree(state.pos));
+      // Real orientation, not just position -- a plate/cup/fork left at a
+      // fixed default rotation while the physics actually tips/spins it
+      // was itself a "wrong placement" symptom, not just a cosmetic gap.
+      if (state.quat) target.quaternion.copy(mjQuatToThree(state.quat));
+    }
+  }
+
+  if (msg.robot_state) applyRobotState(msg.robot_state);
+
+  if (msg.subtasks) renderSubtasks(msg.subtasks);
+}
+
+function renderSubtasks(subtasks) {
+  subtaskList.innerHTML = '';
+  for (const [name, status] of Object.entries(subtasks)) {
+    const row = document.createElement('div');
+    row.className = 'subtask-row';
+    row.innerHTML = `<span class="badge ${status}"></span><span class="subtask-name">${name.replace(/_/g,' ')}</span><span class="subtask-status">${status.replace('_',' ')}</span>`;
+    subtaskList.appendChild(row);
+  }
+}
+
+function sendInstruction() {
+  const text = chatInput.value.trim();
+  if (!text || !ws || ws.readyState !== WebSocket.OPEN) return;
+  logLine('you: ' + text, 'you');
+  ws.send(JSON.stringify({ type: 'instruction', text }));
+  chatInput.value = '';
+}
+
+sendBtn.addEventListener('click', sendInstruction);
+chatInput.addEventListener('keydown', (e) => { if (e.key === 'Enter') sendInstruction(); });
+stopBtn.addEventListener('click', () => {
+  if (ws && ws.readyState === WebSocket.OPEN) { ws.send(JSON.stringify({ type: 'stop' })); logLine('stopped'); }
+});
+resetBtn.addEventListener('click', () => {
+  const seed = parseInt(seedSelect.value, 10) || 0;
+  if (ws && ws.readyState === WebSocket.OPEN) {
+    ws.send(JSON.stringify({ type: 'reset', seed }));
+    logLine('reset to seed ' + seed);
+  }
+});
+
+async function loadInfo() {
+  try {
+    const res = await fetch('/api/info');
+    const info = await res.json();
+    seedSelect.innerHTML = '';
+    (info.seeds || [0]).forEach((s) => {
+      const opt = document.createElement('option');
+      opt.value = s; opt.textContent = 'seed ' + s;
+      seedSelect.appendChild(opt);
+    });
+
+    if (info.static_scene) buildStaticScene(info.static_scene);
+    if (info.object_meshes) buildObjectMeshes(info.object_meshes);
+    if (info.object_primitives) buildObjectPrimitives(info.object_primitives);
+
+    if (info.arm_rig) buildArmRig(info.arm_rig); // builds the arm chain from the MJCF's own geoms; see buildArmRig's own header comment
+
+    // Everything above (table/drawer/object meshes, and now the arm rig
+    // too) is built synchronously from this one /api/info fetch -- no
+    // separate async asset load to gate on anymore, so the scene is fully
+    // ready for a WS state message right here.
+    markSceneReady();
+  } catch (err) {
+    logLine('failed to load /api/info: ' + err, 'err');
+  }
+}
+
+loadInfo();
+connect();
+</script>
+</body>
+</html>
