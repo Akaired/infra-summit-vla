@@ -204,11 +204,22 @@ def describe_object_meshes(scene: EpisodeScene) -> dict[str, Any]:
 
     Frame chain per MuJoCo's own compiled-mesh convention: world position
     for vertex v of this geom's mesh is
-        body_xpos + body_xmat @ (geom_pos + geom_mat @ (mesh_pos + mesh_mat @ mesh_vert[v]))
-    Sending mesh_pos/mesh_quat and geom_pos/geom_quat (both already relative
-    to the body, like describe_arm_rig's link geoms) lets the frontend do
-    that same chain once at load time, then just move/rotate the body each
-    tick from the live "objects" pos+quat -- no per-vertex work at runtime.
+        body_xpos + body_xmat @ (geom_pos + geom_mat @ mesh_vert[v])
+    NOT mesh_pos/mesh_quat as well -- model.mesh_vert is already the
+    COMPILED mesh (MuJoCo re-centers/re-aligns each mesh asset to its own
+    inertial frame at compile time, and bakes that exact offset into the
+    referencing geom's geom_pos/geom_quat; mesh_pos/mesh_quat only matter if
+    you instead load raw vertices from the *original* OBJ/STL file, which
+    this does not). Using both double-applies the same offset -- confirmed
+    against a real case here: this repo's mesh geoms (plate/cup/spoon/fork)
+    have no explicit pos/quat in their <geom> tag, so the compiler set
+    geom_pos/geom_quat equal to mesh_pos/mesh_quat exactly (identity-compose
+    with an unset geom pose), and applying both rotated the mesh through
+    that same rotation twice, landing objects on their side instead of flat.
+    Sending geom_pos/geom_quat (already relative to the body, like
+    describe_arm_rig's link geoms) lets the frontend bake that chain once at
+    load time, then just move/rotate the body each tick from the live
+    "objects" pos+quat -- no per-vertex work at runtime.
     """
     import mujoco
 
@@ -245,8 +256,6 @@ def describe_object_meshes(scene: EpisodeScene) -> dict[str, Any]:
         entry: dict[str, Any] = {
             "vertices": model.mesh_vert[v0 : v0 + vn].tolist(),
             "faces": model.mesh_face[f0 : f0 + fn].tolist(),
-            "mesh_pos": model.mesh_pos[mesh_id].tolist(),
-            "mesh_quat": model.mesh_quat[mesh_id].tolist(),  # wxyz
             "geom_pos": model.geom_pos[mesh_geom].tolist(),
             "geom_quat": model.geom_quat[mesh_geom].tolist(),  # wxyz
         }
@@ -366,6 +375,25 @@ def describe_static_scene(scene: EpisodeScene) -> dict[str, Any]:
         scene.sim_cfg["robot"]["right_arm_prefix"],
     )
 
+    # Every tracked object (sim.yaml:objects) is already drawn and moved by
+    # the frontend's own "objects" WS-driven path (either a real mesh via
+    # object_meshes, or -- for a body with no mesh, like "bottle", a
+    # primitive cylinder -- meshForObject()'s shape-matched fallback).
+    # "drawer" is the one exception: it needs its actual multi-panel shell
+    # geometry (floor/walls/handle), which only this function reads, so it
+    # stays in static_scene -- the frontend keeps a reference to that one
+    # group (jointedBodies) and repositions THAT from live "objects" data
+    # instead of drawing a second, competing primitive for it. Every other
+    # tracked body (bottle, plate, cup, spoon_*, fork_*) must NOT also get a
+    # static_scene entry, or the frontend ends up with two separate,
+    # independently-updated objects for the same body -- one that tracks the
+    # physics and one static leftover from its initial pose.
+    objects_cfg = scene.sim_cfg.get("objects", {})
+    tracked_names: set[str] = set()
+    for value in objects_cfg.values():
+        tracked_names.update(value if isinstance(value, list) else [value])
+    tracked_names.discard("drawer")
+
     bodies: dict[str, Any] = {}
     for body_id in range(model.nbody):
         body_name = mujoco.mj_id2name(model, mujoco.mjtObj.mjOBJ_BODY, body_id) or ""
@@ -373,6 +401,8 @@ def describe_static_scene(scene: EpisodeScene) -> dict[str, Any]:
             continue
         if any(body_name.startswith(p) for p in prefixes):
             continue  # arm bodies: already described by describe_arm_rig()
+        if body_name in tracked_names:
+            continue  # tracked object: drawn/moved via "objects", not here
 
         geoms = []
         for gid in range(model.ngeom):
