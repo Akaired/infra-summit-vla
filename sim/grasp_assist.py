@@ -33,6 +33,7 @@ class GraspAssist:
         self.plate_active = False
         self.plate_release_armed = False
         self.plate_release_requested_at: int | None = None
+        self.plate_open_hold_steps = 0
         
         self.plate_activation_z: float | None = None
         self.plate_was_lifted = False
@@ -53,6 +54,7 @@ class GraspAssist:
         self.plate_active = False
         self.plate_release_armed = False
         self.plate_release_requested_at = None
+        self.plate_open_hold_steps = 0
         
         self.plate_activation_z: float | None = None
         self.plate_was_lifted = False
@@ -401,6 +403,7 @@ class GraspAssist:
                 self.plate_was_lifted = False
                 self.plate_release_armed = False
                 self.plate_release_requested_at = None
+                self.plate_open_hold_steps = 0
 
                 source = (
                     "contact"
@@ -447,11 +450,17 @@ class GraspAssist:
         ):
             self.plate_release_armed = True
 
+        if gripper_value >= float(cfg["open_threshold"]):
+            self.plate_open_hold_steps += 1
+        else:
+            self.plate_open_hold_steps = 0
+
         if (
             self.plate_was_lifted
             and self.plate_release_armed
             and self.plate_release_requested_at is None
-            and gripper_value >= float(cfg["open_threshold"])
+            and self.plate_open_hold_steps
+            >= int(cfg["release_open_hold_policy_steps"])
         ):
             self.plate_release_requested_at = policy_step
             print(
@@ -500,6 +509,7 @@ class GraspAssist:
             self.plate_was_lifted = False
             self.plate_release_armed = False
             self.plate_release_requested_at = None
+            self.plate_open_hold_steps = 0
 
             self._log(
                 f"plate released at step={policy_step}, "

@@ -443,5 +443,7 @@
   <equality>
     <weld name="left_grasp_weld" body1="left_gripper" body2="plate"
           anchor="0 0 0" relpose="0 0 0 1 0 0 0" active="false" solref="0.002 1" solimp="0.9 0.95 0.001"/>
+    <weld name="right_grasp_weld" body1="right_gripper" body2="cup"
+          anchor="0 0 0" relpose="0 0 0 1 0 0 0" active="false" solref="0.002 1" solimp="0.9 0.95 0.001"/>
   </equality>
 </mujoco>

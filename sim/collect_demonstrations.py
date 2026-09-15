@@ -24,10 +24,6 @@ RANDOMIZATION_CFG = "configs/randomization.yaml"
 FPS = 30
 RENDER_EVERY_N_STEPS = 2
 
-# Hard timeout for the plate weld release, in control steps past the
-# commanded-open step. No site_z gate anymore -- the old site_z<0.80-only
-# gate could leave the weld active forever if the arm never got that low
-# (observed: dragged the plate back home for the rest of the episode).
 RELEASE_TIMEOUT_STEPS = 40
 RELEASE_SITE_Z = 0.85
 
@@ -85,18 +81,38 @@ def _apply_qpos_to_ctrl(model, data, qpos):
         data.ctrl[act_id] = qpos[qpos_adr]
 
 
-def _find_plate_release_step(gripper_trace):
-    prev_left_val = None
+def _find_first_transition(gripper_trace, side):
+    """First closed->open transition for the given side."""
+    prev = None
     for i, g in enumerate(gripper_trace):
         if g is None:
             continue
-        side, val = g
-        if side != "left":
+        s, val = g
+        if s != side:
             continue
-        if prev_left_val is not None and prev_left_val < 0.0 and val > 0.0:
+        if prev is not None and prev < 0.0 and val > 0.0:
             return i
-        prev_left_val = val
+        prev = val
     return None
+
+
+def _find_last_transition(gripper_trace, side):
+    """Last closed->open transition for the given side. The right gripper
+    opens once for the drawer-handle release (early in the trace) and once
+    for the cup release (late) -- the cup release must use the LAST one,
+    not the first, or the cup weld will be released far too early."""
+    last = None
+    prev = None
+    for i, g in enumerate(gripper_trace):
+        if g is None:
+            continue
+        s, val = g
+        if s != side:
+            continue
+        if prev is not None and prev < 0.0 and val > 0.0:
+            last = i
+        prev = val
+    return last
 
 
 def collect(n_episodes, repo_id, root, instruction, control_decimation=10, seed_offset=0):
@@ -116,8 +132,14 @@ def collect(n_episodes, repo_id, root, instruction, control_decimation=10, seed_
         model.body("left_gripper").id,
         model.body("left_moving_jaw_so101_v1").id,
     }
+    right_gripper_bodies = {
+        model.body("right_gripper").id,
+        model.body("right_moving_jaw_so101_v1").id,
+    }
     plate_bid = model.body("plate").id
+    cup_bid = model.body("cup").id
     left_site_id = model.site("left_gripperframe").id
+    right_site_id = model.site("right_gripperframe").id
 
     seed_rng = np.random.RandomState(seed_offset)
     used_seeds = []
@@ -137,13 +159,15 @@ def collect(n_episodes, repo_id, root, instruction, control_decimation=10, seed_
             model, data, randomizer
         )
 
-        plate_open_step = _find_plate_release_step(gripper_trace)
+        plate_open_step = _find_first_transition(gripper_trace, "left")
+        cup_open_step = _find_last_transition(gripper_trace, "right")
         plate_weld_armed = True
         plate_weld_released = False
+        cup_weld_armed = True
+        cup_weld_released = False
 
         print(f"[collect] trajectory: {len(qpos_trace)} steps, "
-              f"cutlery-in-drawer={sorted(randomizer.last_in_drawer_items)}, "
-              f"plate_release_step={plate_open_step}")
+              f"plate_release_step={plate_open_step}, cup_release_step={cup_open_step}")
 
         for step_idx in range(len(qpos_trace)):
             _apply_qpos_to_ctrl(model, data, qpos_trace[step_idx])
@@ -162,9 +186,7 @@ def collect(n_episodes, repo_id, root, instruction, control_decimation=10, seed_
             if step_idx == grasp_events["deactivate_step"]:
                 deactivate_grasp_connect(model, data, grasp_events["eq_name"])
 
-            # --- Left arm: plate WELD, NO GATES. Fires on any contact
-            # between any left-gripper body and the plate, at any gripper
-            # position. Simplified spec: not a clean rim grasp, glue-and-carry.
+            # --- Left arm: plate WELD, no gates, first contact -----------
             if plate_weld_armed:
                 for c in range(data.ncon):
                     con = data.contact[c]
@@ -176,18 +198,39 @@ def collect(n_episodes, repo_id, root, instruction, control_decimation=10, seed_
                                              "left_gripper", "plate")
                         plate_weld_armed = False
                         break
-
-            # --- Left arm: plate WELD release. Commanded-open + hard
-            # timeout (RELEASE_TIMEOUT_STEPS), OR site_z < RELEASE_SITE_Z,
-            # whichever first. No indefinite wait.
             if (plate_open_step is not None
                     and step_idx >= plate_open_step
                     and not plate_weld_released):
                 steps_since_open = step_idx - plate_open_step
                 site_z = data.site_xpos[left_site_id][2]
-                if steps_since_open >= RELEASE_TIMEOUT_STEPS or site_z < RELEASE_SITE_Z:
+                plate_place_z = grasp_events["plate_place_z"]
+                gripper_at_place_height = site_z < (plate_place_z + 0.02)
+                if (gripper_at_place_height and steps_since_open >= 5) or steps_since_open >= 80:
                     deactivate_grasp_weld(model, data, "left_grasp_weld")
                     plate_weld_released = True
+
+            # --- Right arm: cup WELD, no gates, first contact -----------
+            if cup_weld_armed:
+                for c in range(data.ncon):
+                    con = data.contact[c]
+                    b1 = int(model.geom_bodyid[con.geom1])
+                    b2 = int(model.geom_bodyid[con.geom2])
+                    if ((b1 in right_gripper_bodies and b2 == cup_bid)
+                            or (b2 in right_gripper_bodies and b1 == cup_bid)):
+                        activate_grasp_weld(model, data, "right_grasp_weld",
+                                             "right_gripper", "cup")
+                        cup_weld_armed = False
+                        break
+            if (cup_open_step is not None
+                    and step_idx >= cup_open_step
+                    and not cup_weld_released):
+                steps_since_open = step_idx - cup_open_step
+                site_z = data.site_xpos[right_site_id][2]
+                cup_place_z = grasp_events["cup_place_z"]
+                gripper_at_cup_height = site_z < (cup_place_z + 0.02)
+                if (gripper_at_cup_height and steps_since_open >= 5) or steps_since_open >= 80:
+                    deactivate_grasp_weld(model, data, "right_grasp_weld")
+                    cup_weld_released = True
 
             for _ in range(control_decimation):
                 mujoco.mj_step(model, data)
@@ -206,10 +249,12 @@ def collect(n_episodes, repo_id, root, instruction, control_decimation=10, seed_
                 frame[f"observation.images.{cam_name}"] = img
             dataset.add_frame(frame)
 
-        # Verify the release actually happened -- never crash, warn instead.
         if not plate_weld_released:
-            print(f"[collect] WARNING: weld never released on seed {seed} -- forcing release now.")
+            print(f"[collect] WARNING: plate weld never released on seed {seed} -- forcing release now.")
             deactivate_grasp_weld(model, data, "left_grasp_weld")
+        if not cup_weld_released:
+            print(f"[collect] WARNING: cup weld never released on seed {seed} -- forcing release now.")
+            deactivate_grasp_weld(model, data, "right_grasp_weld")
 
         dataset.save_episode()
         print(f"[collect] episode {ep+1}/{n_episodes} recorded (seed={seed})")
@@ -228,7 +273,10 @@ if __name__ == "__main__":
     parser.add_argument("--repo-id", type=str, default="local/dinner_table_ik")
     parser.add_argument("--root", type=str, default="./data/demo_dataset")
     parser.add_argument("--instruction", type=str,
-                         default="open the drawer, retrieve the cutlery, close the drawer, set the table")
+                         default="Open the drawer, close the drawer, pick up the plate and "
+                                  "place it on the table, then pick up the cup and place it "
+                                  "next to the plate")
+    
     parser.add_argument("--seed-offset", type=int, default=0)
     args = parser.parse_args()
 
