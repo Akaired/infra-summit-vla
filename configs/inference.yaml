@@ -8,8 +8,9 @@
 # edit, not a code edit.
 
 model:
-  ir_xml: outputs/export/openvino/policy.xml
-  ir_bin: outputs/export/openvino/policy.bin
+  ir_xml: outputs/export/openvino/velocity_step.xml
+  ir_bin: outputs/export/openvino/velocity_step.bin
+  manifest: outputs/export/openvino/manifest.json
 
 # CPU | GPU | NPU | AUTO  (GPU = Intel iGPU on Core Ultra)
 device: CPU

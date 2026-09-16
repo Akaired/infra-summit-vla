@@ -81,6 +81,7 @@ class RuntimeConfig:
 
     ir_xml: Path
     ir_bin: Path
+    manifest: Path
     device: str
     precision: str
     performance_hint: str
@@ -115,6 +116,7 @@ class RuntimeConfig:
         fields = {
             "ir_xml": model.get("ir_xml"),
             "ir_bin": model.get("ir_bin"),
+            "manifest": model.get("manifest"),
             "device": raw.get("device"),
             "precision": raw.get("precision"),
             "performance_hint": runtime.get("performance_hint"),
@@ -152,6 +154,7 @@ class RuntimeConfig:
         return cls(
             ir_xml=_resolve_path(fields["ir_xml"]),
             ir_bin=_resolve_path(fields["ir_bin"]),
+            manifest=_resolve_path(fields["manifest"]),
             device=device,
             precision=precision,
             performance_hint=hint,
@@ -289,6 +292,26 @@ def compile_ir_model(cfg: RuntimeConfig):
     return compiled
 
 
+class _IRBackend:
+    """Real SmolVLA OpenVINO backend, including checkpoint preprocessing."""
+
+    def __init__(self, cfg: RuntimeConfig):
+        from inference.smolvla import SmolVLAOpenVINOBackend
+
+        self._backend = SmolVLAOpenVINOBackend(compile_ir_model(cfg), cfg.manifest)
+
+    @property
+    def action_dim(self) -> int:
+        return self._backend.action_dim
+
+    @property
+    def image_shape(self) -> tuple[int, int, int]:
+        return self._backend.image_shape
+
+    def predict(self, instruction: str, observation, robot_state) -> np.ndarray:
+        return self._backend.predict(instruction, observation, robot_state)
+
+
 # ---------------------------------------------------------------------------
 # Preprocessing + backend
 # ---------------------------------------------------------------------------
@@ -365,22 +388,15 @@ def _stub_policy_config(inference_config_path: Path) -> Path:
 def _build_backend(cfg: RuntimeConfig, inference_config_path: Path):
     """Choose the inference backend.
 
-    TODO(inference): when ``/policy`` exports the OpenVINO IR
-    (``configs/inference.yaml:model.ir_xml``), replace the body of this function
-    with::
-
-        return _IRBackend(compile_ir_model(cfg))
-
-    and delete the ``stub:`` block from ``configs/inference.yaml``. The
-    ``_DummyBackend`` path exists only so ``/eval`` and ``/inference`` integrate
-    before that export lands. ``InferenceRuntime.predict`` does not change.
+    A manifest next to the IR marks a genuine SmolVLA tensor export.  The dummy
+    path stays available until the checkpoint and IR are deliberately exported.
     """
     if cfg.ir_xml.is_file():
-        logger.warning(
-            "IR present at %s but _IRBackend is not wired yet -- still using the "
-            "dummy backend (see TODO in inference.runtime._build_backend)",
-            cfg.ir_xml,
-        )
+        if not cfg.manifest.is_file():
+            raise FileNotFoundError(
+                f"OpenVINO IR exists at {cfg.ir_xml}, but its SmolVLA manifest is missing: {cfg.manifest}"
+            )
+        return _IRBackend(cfg)
     return _DummyBackend(_stub_policy_config(inference_config_path))
 
 

@@ -32,3 +32,25 @@ machine.
 
 A checkpoint that produces sane actions in `/sim`, and an OpenVINO IR export that
 `/inference` can load — reproducible from a documented command.
+
+## SmolVLA → OpenVINO bridge
+
+SmolVLA inference normally uses a Transformers `DynamicCache`; this is not an
+OpenVINO tensor ABI. Export the cache-free tensor bridge (it recomputes the
+prefix for every Euler step) and retain the fixed-noise parity artifact:
+
+```bash
+python -m policy.openvino_export --checkpoint checkpoints/smolvla_base --output-dir outputs/export/openvino --vlm-model-path /path/to/SmolVLM2-500M-Video-Instruct
+python -m policy.openvino_parity --export-dir outputs/export/openvino --device CPU
+python -m policy.openvino_demo --export-dir outputs/export/openvino
+```
+
+The second command compares OpenVINO with cache-free PyTorch and reports the
+native cached-path delta separately. FP16 and FP32 exports are supported. INT8
+is intentionally not claimed because NNCF is not among this repository's
+allowed dependencies.
+
+`openvino_demo` has no backend fallback: it compiles `velocity_step.xml`
+directly for the OpenVINO CPU plugin and fails unless that is the actual
+execution device. It prints all ten fixed-noise step comparisons, final action
+parity, output shape, and PyTorch/OpenVINO timing.
