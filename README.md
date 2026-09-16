@@ -96,16 +96,14 @@ uv run --frozen \
   --extra dummy \
   --with fastapi \
   --with "uvicorn[standard]" \
-  python apps/web/server.py --config configs/eval.yaml --policy dummy
+  python apps/web/server.py --config configs/eval.yaml --policy openvino
 ```
 
 Then open <http://localhost:8000>, choose a seed, enter an instruction such as
 `open the top drawer`, and press **Send**. The server listens on `0.0.0.0`, so
 another device on the same network can use `http://<machine-ip>:8000`.
 
-The viewer calls the shared `eval.policy_interface.build_policy()` factory. Once
-the inference runtime implements its `openvino` branch, start the same viewer
-with `--policy openvino`; no viewer-side policy integration is required. See
+The viewer calls the shared `eval.policy_interface.build_policy()` factory. See
 [`apps/web/README.md`](./apps/web/README.md) for its architecture and controls.
 
 ## No hardcoded values
@@ -135,16 +133,6 @@ rejected in review. See [`configs/README.md`](./configs/README.md).
 | 15 | Robustness & generalization (10 randomized seeds) |
 | 10 | Technical quality & reproducibility |
 | 5 | Innovation & technical demonstration |
-
-## Open questions
-
-Unresolved team decisions, tracked in PRD §7 — not to be settled inside a PR:
-
-1. Base policy: SmolVLA / Pi0.5 / ACT.
-2. Demonstration data: self-collected MuJoCo teleop vs. an existing LeRobot dataset.
-3. **Who has access to an Intel Core Ultra Series 2/3 machine** — blocks deliverables #3 and #4.
-4. Reasoning split between the VLA policy and an auxiliary LLM/VLM planning layer.
-5. Target precision (FP16 vs INT8) and device (CPU/iGPU/NPU).
 
 ## Workflow
 
