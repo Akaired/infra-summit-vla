@@ -1,0 +1,109 @@
+configs:
+  sim: configs/sim.yaml
+  randomization: configs/randomization.yaml
+  grasp_assist: configs/grasp_assist.yaml
+
+model:
+  checkpoint: checkpoints/048000-native-geometry
+  device: cpu
+  torch_seed_offset: 0
+  n_action_steps: 50
+
+task:
+  instruction: >-
+    Open the drawer, close the drawer, pick up the plate, and place the
+    plate in the center of the table.
+  task_feature_key: task
+
+observation:
+  state:
+    source_key: robot_state
+    feature_key: observation.state
+    start: 0
+    size: 12
+  images_source_key: images
+  pixel_divisor: 255.0
+  resize:
+    mode: bilinear
+    align_corners: false
+    antialias: true
+  cameras:
+    - source_name: overhead
+      feature_key: observation.images.overhead
+    - source_name: wrist_left
+      feature_key: observation.images.wrist_left
+    - source_name: wrist_right
+      feature_key: observation.images.wrist_right
+
+action:
+  feature_key: action
+  size: 12
+  clip_to_actuator_range: true
+  actuator_names:
+    - left_shoulder_pan
+    - left_shoulder_lift
+    - left_elbow_flex
+    - left_wrist_flex
+    - left_wrist_roll
+    - left_gripper
+    - right_shoulder_pan
+    - right_shoulder_lift
+    - right_elbow_flex
+    - right_wrist_flex
+    - right_wrist_roll
+    - right_gripper
+
+rollout:
+  action_repeat: 2
+  max_policy_steps: 600
+  stop_on_success: true
+  success_hold_policy_steps: 10
+  progress_every_policy_steps: 25
+  deterministic_render: true
+  deterministic_kernels: true
+
+evaluation:
+  seeds:
+    source_config: configs/randomization.yaml
+    source_key: seeds
+  events:
+    drawer_opened: drawer_opened
+    drawer_closed: drawer_closed
+    plate_lifted: plate_lifted
+    plate_placed: plate_placed
+  sequence:
+    - drawer_opened
+    - drawer_closed
+    - plate_lifted
+    - plate_placed
+  drawer:
+    joint_name: drawer_slide
+    opened_travel_fraction: 0.60
+    closed_travel_fraction: 0.15
+  plate:
+    body_name: plate
+    lifted_delta_z_m: 0.05
+    placed_min_xy_displacement_m: 0.05
+    surface_z_tolerance_m: 0.035
+    resting_linear_speed_mps: 0.08
+    target_xy_m: [0.0, 0.0]
+    target_radius_m: 0.12
+    gripper_action_index: 5
+    gripper_close_threshold: -0.08
+    gripper_contact_bodies:
+      - left_gripper
+      - left_moving_jaw_so101_v1
+
+grasp_assist: {}
+
+output:
+  directory: outputs/eval/ckpt-048000-native
+  overwrite: true
+  episodes_filename: episodes.jsonl
+  summary_filename: summary.json
+  video:
+    enabled: true
+    camera: overhead
+    fps: 25
+    every_n_policy_steps: 1
+    filename_pattern: seed_{seed}.mp4
